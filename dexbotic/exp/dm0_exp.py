@@ -131,7 +131,15 @@ class DM0ComputeNormActionConfig(ComputeNormActionConfig):
         return robot_dataset_list
 
     def _process_one_dataset(self, dataset_name: str, dataset: DexDataset) -> str:
-        dataloader = DataLoader(dataset, batch_size=128, shuffle=True, num_workers=64)
+        num_workers = int(os.getenv("DEXBOTIC_NORM_NUM_WORKERS", "4"))
+        batch_size = int(os.getenv("DEXBOTIC_NORM_BATCH_SIZE", "32"))
+        dataloader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            persistent_workers=num_workers > 0,
+        )
 
         norm_keys = ["state", "action"]
         stats = {key: normalize.RunningStats() for key in norm_keys}
@@ -322,18 +330,30 @@ class DM0InferenceConfig(Config):
     num_images: int = field(default=3)
     non_delta_mask: list[int] = field(default_factory=lambda: [6])
     action_dim: int = field(default=7)
+    device_map: Optional[dict | str] = field(default="auto")
+    cuda_device: Optional[int] = field(default=None)
 
     def _load_model(self) -> None:
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if torch.cuda.is_available():
+            if self.cuda_device is not None:
+                self.device = torch.device(f"cuda:{self.cuda_device}")
+            else:
+                self.device = torch.device("cuda")
+        else:
+            self.device = torch.device("cpu")
         logger.info(f"Loading model from {self.model_name_or_path}")
         logger.info(f"Using device: {self.device}")
-        model = DM0ForCausalLM.from_pretrained(
-            self.model_name_or_path,
-            torch_dtype=torch.float32,
-            low_cpu_mem_usage=True,
-            trust_remote_code=True,
-            device_map="auto",
-        ).to(self.device)
+        load_kwargs = {
+            "torch_dtype": torch.float32,
+            "low_cpu_mem_usage": True,
+            "trust_remote_code": True,
+        }
+        if self.device_map is not None:
+            load_kwargs["device_map"] = self.device_map
+            logger.info(f"Using device_map: {self.device_map}")
+        model = DM0ForCausalLM.from_pretrained(self.model_name_or_path, **load_kwargs)
+        if self.device_map is None:
+            model = model.to(self.device)
 
         tokenizer = AutoTokenizer.from_pretrained(
             self.model_name_or_path, use_fast=False, trust_remote_code=True

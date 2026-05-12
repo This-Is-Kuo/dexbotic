@@ -182,3 +182,24 @@ dexbotic/data/data_source/*.py
 !dexbotic/data/data_source/__init__.py
 !dexbotic/data/data_source/register.py
 dexbotic/norm_assets
+
+# Local Codex / open-loop debug workspace
+.codex
+.codex/
+openloop/artifacts/
+debug_openloop_gpu/
+debug_openloop_retrain_compare/
+debug_openloop_resume_eval_v2/
+debug_openloop_stateful_compare/
+tmp_openloop_arrays/
+tmp_openloop_chunk_arrays/
+tmp_single_gpu_switch_arrays/
+tmp_openloop_metrics.json
+tmp_openloop_chunk_metrics.json
+tmp_openloop_raw.png
+tmp_openloop_norm.png
+tmp_openloop_chunk_raw.png
+tmp_openloop_chunk_norm.png
+tmp_single_gpu_switch_metrics.json
+tmp_single_gpu_switch_raw.png
+tmp_single_gpu_switch_norm.png

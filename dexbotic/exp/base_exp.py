@@ -420,7 +420,9 @@ class ActionConfig(Config):
         assert megfile.smart_exists(
             norm_stats_path), f'Norm stats file {norm_stats_path} not found'
         with megfile.smart_open(norm_stats_path, 'r') as f:
-            norm_stats = json.load(f)['norm_stats']
+            norm_stats = json.load(f)
+            if 'norm_stats' in norm_stats:
+                norm_stats = norm_stats['norm_stats']
             norm_stats = ToNumpy()(norm_stats)
         return norm_stats
 
