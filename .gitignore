@@ -203,3 +203,5 @@ tmp_openloop_chunk_norm.png
 tmp_single_gpu_switch_metrics.json
 tmp_single_gpu_switch_raw.png
 tmp_single_gpu_switch_norm.png
+#tmp
+/tmp/
