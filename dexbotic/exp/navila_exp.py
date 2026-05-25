@@ -545,7 +545,7 @@ class NaVILAExp(BaseExp):
 
         trainer_kwargs = {
             "model": self.model,
-            "tokenizer": self.tokenizer,
+            "processing_class": self.tokenizer,
             "exp_config": self,
             "train_dataset": train_dataset,
             "data_collator": data_collator,

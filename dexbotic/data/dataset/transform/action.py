@@ -248,6 +248,12 @@ class ActionNorm:
         self.use_quantiles = use_quantiles
 
     def __call__(self, episode_data_dict: dict, **kwargs) -> dict:
+        # [DISABLED] This early return breaks inference: during inference the dict
+        # contains "state" but no "action", causing state to skip normalization.
+        # Affects all models (PI0/PI05/DM0). Training is unaffected since training
+        # data always has "action" key.
+        # if "action" not in episode_data_dict:
+        #     return episode_data_dict
 
         for key in self.statistic_mapping.keys():
             if self.strict:

@@ -2,6 +2,7 @@ import math
 import os
 from typing import TYPE_CHECKING, Optional
 import shutil
+from unittest.mock import patch
 
 import torch
 import transformers
@@ -10,6 +11,7 @@ from easydict import EasyDict
 from torch.optim.lr_scheduler import LambdaLR
 from transformers import Trainer, TrainingArguments
 
+from dexbotic.exp.backend_resolver import resolve_backend_mode
 from dexbotic.exp.utils import get_mm_adapter_state_maybe_zero_3
 from dexbotic.model.dexbotic_arch import DexboticVLMModel
 
@@ -20,9 +22,200 @@ if TYPE_CHECKING:
 class DexboticTrainer(Trainer):
     def __init__(self, *args, **kwargs):
         self.exp_config: BaseExp = kwargs.pop("exp_config")
+        self.backend_resolution = self.exp_config.backend_resolution
+        if self.backend_resolution is None:
+            self.backend_resolution = resolve_backend_mode(self.exp_config.trainer_config)
+            self.exp_config.backend_resolution = self.backend_resolution
+        self._explicit_fsdp_plugin_kwargs = self.backend_resolution.plugin_kwargs
+        self._deepspeed_detection_patcher = None
+        self._maybe_disable_deepspeed_detection()
         training_args = self._link_exp_config()
         super().__init__(*args, args=training_args, **kwargs)
         self.loss_cache = {}
+
+    def _maybe_disable_deepspeed_detection(self):
+        if self.backend_resolution.resolved_mode == "deepspeed_trainer":
+            return
+
+        from accelerate.utils import other as accelerate_other
+
+        self._deepspeed_detection_patcher = patch.object(
+            accelerate_other,
+            "is_deepspeed_available",
+            return_value=False,
+        )
+        self._deepspeed_detection_patcher.start()
+
+    def __del__(self):
+        patcher = getattr(self, "_deepspeed_detection_patcher", None)
+        if patcher is not None:
+            patcher.stop()
+
+    def _build_explicit_fsdp_plugin(self):
+        if not self._explicit_fsdp_plugin_kwargs:
+            return None
+
+        from accelerate.utils.dataclasses import FullyShardedDataParallelPlugin
+
+        return FullyShardedDataParallelPlugin(**self._explicit_fsdp_plugin_kwargs)
+
+    def _build_explicit_accelerator_dataloader_config(self):
+        from accelerate.utils.dataclasses import DataLoaderConfiguration
+        from transformers.trainer import logger as trainer_logger
+
+        grad_acc_kwargs = {}
+        if self.args.accelerator_config.gradient_accumulation_kwargs is not None:
+            grad_acc_kwargs = self.args.accelerator_config.gradient_accumulation_kwargs
+
+        if "num_steps" in grad_acc_kwargs:
+            if self.args.gradient_accumulation_steps > 1:
+                raise ValueError(
+                    "The `AcceleratorConfig`'s `num_steps` is set but "
+                    "`gradient_accumulation_steps` is greater than 1 in the passed `TrainingArguments`."
+                )
+            self.args.gradient_accumulation_steps = grad_acc_kwargs["num_steps"]
+
+        accelerator_config = self.args.accelerator_config.to_dict()
+        dataloader_params = [
+            "split_batches",
+            "dispatch_batches",
+            "even_batches",
+            "use_seedable_sampler",
+        ]
+        dataloader_config = DataLoaderConfiguration(
+            **{param: accelerator_config.pop(param) for param in dataloader_params}
+        )
+        dataloader_config.data_seed = self.args.data_seed
+
+        non_blocking = accelerator_config.pop("non_blocking")
+        if non_blocking and not self.args.dataloader_pin_memory:
+            trainer_logger.warning(
+                "`non_blocking` is enabled but `dataloader_pin_memory` is not."
+            )
+        dataloader_config.non_blocking = non_blocking
+        accelerator_config.pop("gradient_accumulation_kwargs")
+        return dataloader_config
+
+    def _build_explicit_accelerator_kwargs(self):
+        args = {
+            "deepspeed_plugin": self.args.deepspeed_plugin,
+            "fsdp_plugin": self._build_explicit_fsdp_plugin(),
+            "dataloader_config": self._build_explicit_accelerator_dataloader_config(),
+        }
+
+        if self.args.parallelism_config is not None:
+            args["parallelism_config"] = self.args.parallelism_config
+
+        if (
+            hasattr(self.model, "tp_size")
+            and self.model.tp_size is not None
+            and self.model.tp_size > 1
+        ):
+            self.is_tp_enabled = True
+            from accelerate import TorchTensorParallelPlugin
+
+            args["torch_tp_plugin"] = TorchTensorParallelPlugin(tp_size=self.model.tp_size)
+
+        return args
+
+    def _postprocess_accelerator_state(self):
+        import functools
+        import inspect
+
+        self.gather_function = self.accelerator.gather_for_metrics
+        if "use_gather_object" in inspect.signature(self.gather_function).parameters:
+            self.gather_function = functools.partial(
+                self.gather_function,
+                use_gather_object=self.args.eval_use_gather_object,
+            )
+
+        self.is_deepspeed_enabled = (
+            getattr(self.accelerator.state, "deepspeed_plugin", None) is not None
+        )
+        self.is_fsdp_enabled = (
+            getattr(self.accelerator.state, "fsdp_plugin", None) is not None
+        )
+        self.is_tp_enabled = (
+            getattr(self.accelerator.state, "torch_tp_plugin", None) is not None
+        )
+
+        if self.is_fsdp_enabled:
+            fsdp_plugin = self.accelerator.state.fsdp_plugin
+            for param in ["limit_all_gathers", "activation_checkpointing"]:
+                setattr(
+                    fsdp_plugin,
+                    param,
+                    self.args.fsdp_config.get(param, getattr(fsdp_plugin, param)),
+                )
+            if fsdp_plugin.activation_checkpointing and self.args.gradient_checkpointing:
+                raise ValueError(
+                    "The activation_checkpointing in FSDP config and gradient_checkpointing "
+                    "in training args can't be set to True simultaneously."
+                )
+
+        if self.is_deepspeed_enabled and getattr(self.args, "hf_deepspeed_config", None) is None:
+            self.propagate_args_to_deepspeed()
+
+        if (
+            self.args.save_only_model
+            and (self.is_deepspeed_enabled or self.is_fsdp_enabled)
+            and self.args.load_best_model_at_end
+        ):
+            wrapper = "DeepSpeed" if self.is_deepspeed_enabled else "FSDP"
+            raise ValueError(
+                f"{wrapper} can't be used with `save_only_model` along with `load_best_model_at_end`."
+            )
+
+        if (
+            self.is_deepspeed_enabled
+            and self.accelerator.state.deepspeed_plugin.zero_stage == 3
+            and self.args.auto_find_batch_size
+        ):
+            raise ValueError(
+                "`auto_find_batch_size` isn't supported yet with DeepSpeed Zero-3."
+            )
+        if (
+            self.args.save_only_model
+            and self.is_fsdp_enabled
+            and "SHARDED_STATE_DICT" in str(self.accelerator.state.fsdp_plugin.state_dict_type)
+        ):
+            raise ValueError(
+                "save_only_model option is not compatible with FSDP state dict type 'SHARDED_STATE_DICT'"
+            )
+
+    def _sync_fsdp_state_dict_type(self):
+        """Sync state_dict_type from TrainingArguments.fsdp_config to the FSDP plugin.
+
+        HF Trainer's native ``create_accelerator_and_postprocess`` creates the
+        ``FullyShardedDataParallelPlugin`` without passing ``state_dict_type``,
+        so the plugin falls back to its default (``SHARDED_STATE_DICT`` for
+        FSDP2).  If the user explicitly configured ``state_dict_type`` in
+        ``fsdp_config``, we apply it here after the accelerator is created.
+        """
+        if not self.is_fsdp_enabled:
+            return
+        desired = (self.args.fsdp_config or {}).get("state_dict_type")
+        if desired is None:
+            return
+        fsdp_plugin = self.accelerator.state.fsdp_plugin
+        fsdp_plugin.set_state_dict_type(desired)
+
+    def create_accelerator_and_postprocess(self):
+        if not self._explicit_fsdp_plugin_kwargs:
+            super().create_accelerator_and_postprocess()
+            self._sync_fsdp_state_dict_type()
+            return
+
+        from accelerate import Accelerator
+        from transformers.trainer import is_accelerate_available
+
+        if not is_accelerate_available("1.10.0"):
+            raise ImportError(
+                "Explicit FSDP2 plugin integration requires accelerate v1.10.0 and above."
+            )
+
+        self.accelerator = Accelerator(**self._build_explicit_accelerator_kwargs())
+        self._postprocess_accelerator_state()
 
     def create_optimizer(self) -> torch.optim.Optimizer:
         opt_model: DexboticVLMModel = self.model
@@ -129,38 +322,77 @@ class DexboticTrainer(Trainer):
 
     def _link_exp_config(self) -> TrainingArguments:
         """Link the exp config to the trainer args"""
+        trainer_config = self.exp_config.trainer_config
+        resolution = self.backend_resolution
         linked_args = {
-            "output_dir": self.exp_config.trainer_config.output_dir,
-            "num_train_epochs": self.exp_config.trainer_config.num_train_epochs,
-            "max_steps": self.exp_config.trainer_config.num_train_steps,
-            "per_device_train_batch_size": self.exp_config.trainer_config.per_device_train_batch_size,
-            "gradient_accumulation_steps": self.exp_config.trainer_config.gradient_accumulation_steps,
-            "save_strategy": self.exp_config.trainer_config.save_strategy,
-            "save_steps": self.exp_config.trainer_config.save_steps,
-            "save_total_limit": self.exp_config.trainer_config.save_total_limit,
-            "save_only_model": self.exp_config.trainer_config.save_only_model,
-            "logging_steps": self.exp_config.trainer_config.logging_steps,
-            "gradient_checkpointing": self.exp_config.trainer_config.gradient_checkpointing,
-            "dataloader_num_workers": self.exp_config.trainer_config.dataloader_num_workers,
+            "output_dir": trainer_config.output_dir,
+            "num_train_epochs": trainer_config.num_train_epochs,
+            "max_steps": trainer_config.num_train_steps,
+            "per_device_train_batch_size": trainer_config.per_device_train_batch_size,
+            "gradient_accumulation_steps": trainer_config.gradient_accumulation_steps,
+            "save_strategy": trainer_config.save_strategy,
+            "save_steps": trainer_config.save_steps,
+            "save_total_limit": trainer_config.save_total_limit,
+            "save_only_model": trainer_config.save_only_model,
+            "logging_steps": trainer_config.logging_steps,
+            "gradient_checkpointing": trainer_config.gradient_checkpointing,
+            "dataloader_num_workers": trainer_config.dataloader_num_workers,
             # "model_max_length": self.exp_config.trainer_config.model_max_length,
-            "bf16": self.exp_config.trainer_config.bf16,
-            "tf32": self.exp_config.trainer_config.tf32,
-            "lr_scheduler_type": self.exp_config.trainer_config.lr_scheduler_type,
-            "lr_scheduler_kwargs": self.exp_config.trainer_config.lr_scheduler_kwargs,
-            "run_name": self.exp_config.trainer_config.run_name,
+            "bf16": trainer_config.bf16,
+            "tf32": trainer_config.tf32,
+            "lr_scheduler_type": trainer_config.lr_scheduler_type,
+            "lr_scheduler_kwargs": trainer_config.lr_scheduler_kwargs,
+            "run_name": trainer_config.run_name,
             "remove_unused_columns": False,
-            "deepspeed": self.exp_config.trainer_config.deepspeed,
             "learning_rate": self.exp_config.optimizer_config.base_lr,
             "adam_beta1": self.exp_config.optimizer_config.adam_beta1,
             "adam_beta2": self.exp_config.optimizer_config.adam_beta2,
             "warmup_steps": self.exp_config.optimizer_config.warmup_steps,
             "weight_decay": self.exp_config.optimizer_config.weight_decay,
-            "seed": getattr(self.exp_config.trainer_config, "seed", 42),
-            "data_seed": getattr(self.exp_config.trainer_config, "seed", 42),
+            "seed": getattr(trainer_config, "seed", 42),
+            "data_seed": getattr(trainer_config, "seed", 42),
         }
+        if resolution.resolved_mode == "deepspeed_trainer":
+            linked_args["deepspeed"] = trainer_config.deepspeed
+            # DeepSpeed resume requires optimizer states saved via the DeepSpeed engine
+            # (global_step* subdirectory). save_only_model=True skips that entirely.
+            linked_args["save_only_model"] = False
+        elif resolution.resolved_mode == "ddp_trainer":
+            linked_args["save_only_model"] = trainer_config.save_only_model
+        else:
+            # FSDP checkpoints default to sharded state dicts in the current stack,
+            # which is incompatible with save_only_model=True in Hugging Face Trainer.
+            linked_args["save_only_model"] = False
+            linked_args["fsdp"] = resolution.trainer_fsdp
+            linked_args["fsdp_config"] = dict(resolution.trainer_fsdp_config or {})
+
         self.added_args = EasyDict({
-            "tune_mm_mlp_adapter": self.exp_config.trainer_config.tune_mm_mlp_adapter,
+            "tune_mm_mlp_adapter": trainer_config.tune_mm_mlp_adapter,
+            "train_backend": trainer_config.train_backend,
+            "resolved_mode": resolution.resolved_mode,
         })
+        fsdp_config = linked_args.get("fsdp_config") or {}
+        fsdp_config_summary = None
+        if fsdp_config:
+            fsdp_config_summary = {
+                "fsdp_version": fsdp_config.get("fsdp_version", fsdp_config.get("version")),
+                "transformer_layer_cls_to_wrap": fsdp_config.get("transformer_layer_cls_to_wrap"),
+                "activation_checkpointing": fsdp_config.get("activation_checkpointing"),
+                "cpu_ram_efficient_loading": fsdp_config.get("cpu_ram_efficient_loading"),
+                "reshard_after_forward": fsdp_config.get("reshard_after_forward"),
+            }
+        logger.info(
+            "Training backend summary: requested_backend={}, resolved_mode={}, deepspeed={}, fsdp={}, fsdp_version={}, fsdp_config_summary={}, plugin_kwargs={}, bf16={}, transformers_version={}",
+            trainer_config.train_backend,
+            resolution.resolved_mode,
+            linked_args.get("deepspeed"),
+            linked_args.get("fsdp"),
+            fsdp_config.get("fsdp_version", fsdp_config.get("version")),
+            fsdp_config_summary,
+            resolution.plugin_kwargs,
+            linked_args.get("bf16"),
+            resolution.package_versions.transformers if resolution.package_versions else transformers.__version__,
+        )
         linked_args["gradient_checkpointing_kwargs"] = {"use_reentrant": False}
         linked_args["ddp_find_unused_parameters"] = True
         linked_args["max_grad_norm"] = 1.0
@@ -193,9 +425,7 @@ class DexboticTrainer(Trainer):
             return self._custom_training_step(
                 model, inputs, num_items_in_batch, use_raw_backward
             )
-        else:
-            loss = super().training_step(model, inputs, num_items_in_batch)
-            return loss
+        return super().training_step(model, inputs, num_items_in_batch)
 
     def _custom_training_step(
         self, model, inputs, num_items_in_batch, use_raw_backward
@@ -261,6 +491,15 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer,
     if trainer.deepspeed:
         torch.cuda.synchronize()
         trainer.save_model(output_dir)
+        return
+
+    if getattr(trainer, "is_fsdp_enabled", False):
+        # Keep all ranks aligned around FSDP/FSDP2 state-dict collectives and rank0-only I/O.
+        trainer.accelerator.wait_for_everyone()
+        state_dict = trainer.accelerator.get_state_dict(trainer.model)
+        if trainer.args.should_save:
+            trainer._save(output_dir, state_dict=state_dict)  # noqa
+        trainer.accelerator.wait_for_everyone()
         return
 
     state_dict = trainer.model.state_dict()

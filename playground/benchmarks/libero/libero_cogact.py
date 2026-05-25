@@ -2,7 +2,9 @@ import argparse
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from dexbotic.exp.cogact_exp import (CogACTDataConfig, CogACTExp,
+from dexbotic.data.dataset.transform.action import ActionNormAnd2String
+from dexbotic.data.dataset.transform.language import ReplaceAnswer
+from dexbotic.exp.cogact_exp import (CogACTActionConfig, CogACTDataConfig, CogACTExp,
                                      CogACTModelConfig, CogACTTrainerConfig,
                                      InferenceConfig)
 
@@ -25,6 +27,12 @@ def parse_args():
         '--prompt',
         type=str,
         default=None)
+    parser.add_argument(
+        '--train-backend',
+        type=str,
+        default=None,
+        choices=['deepspeed', 'fsdp', 'fsdp2', 'ddp'],
+    )
     args, unknown = parser.parse_known_args()
     return args
 
@@ -38,8 +46,21 @@ class LiberoCogActTrainerConfig(CogACTTrainerConfig):
 
 
 @dataclass
+class LiberoCogActActionConfig(CogACTActionConfig):
+    def build_action_process_func(self):
+        action_process_func = super().build_action_process_func()
+        for transform in action_process_func.transforms:
+            if isinstance(transform, ActionNormAnd2String):
+                transform.add_answer = False
+            elif isinstance(transform, ReplaceAnswer):
+                transform.replace_existing = True
+        return action_process_func
+
+
+@dataclass
 class LiberoCogActDataConfig(CogACTDataConfig):
     dataset_name: str = field(default='libero_goal+libero_10+libero_spatial+libero_object')
+    action_config: CogACTActionConfig = field(default_factory=LiberoCogActActionConfig)
 
 @dataclass
 class LiberoCogActModelConfig(CogACTModelConfig):
@@ -75,6 +96,8 @@ class LiberoCogActExp(CogACTExp):
 if __name__ == "__main__":
     args = parse_args()
     exp = LiberoCogActExp()
+    if args.train_backend is not None:
+        exp.trainer_config.train_backend = args.train_backend
     if args.task == 'train':
         exp.train()
     elif args.task == 'inference':

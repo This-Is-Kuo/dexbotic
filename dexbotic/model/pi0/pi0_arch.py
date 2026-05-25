@@ -18,6 +18,11 @@ from dexbotic.model.dexbotic_arch import (
     DexboticVLMModel,
 )
 
+try:
+    from torch.distributed._composable.fsdp import FSDPModule as _FSDPModule
+except ImportError:
+    _FSDPModule = None
+
 
 def make_attn_mask(input_mask: torch.BoolTensor, ar_mask: torch.BoolTensor):
     ar_mask = ar_mask.broadcast_to(input_mask.shape)
@@ -108,6 +113,9 @@ class Pi0Model(DexboticVLMModel):
 
 class Pi0ForCausalLM(DexboticForCausalLM, ActionOutputForCausalLM):
     config_class = Pi0Config
+    _tied_weights_keys = {
+        "lm_head.weight": "model.llm.embed_tokens.weight",
+    }
 
     def _real_init(self, config: Pi0Config):
         self.model = Pi0Model(config)
@@ -132,6 +140,13 @@ class Pi0ForCausalLM(DexboticForCausalLM, ActionOutputForCausalLM):
         for layer_idx, layers in enumerate(
             zip(*[module.layers for module in module_list])
         ):
+            # _inner_forward_mot accesses sub-modules directly, bypassing FSDP
+            # pre-forward hooks that would normally all-gather sharded params.
+            if _FSDPModule is not None:
+                for _layer in layers:
+                    if isinstance(_layer, _FSDPModule):
+                        _layer.unshard(async_op=False)
+
             query_list, key_list, value_list = [], [], []
             seq_len_list = []
             for module_idx, (layer, input_embeds) in enumerate(
@@ -176,11 +191,12 @@ class Pi0ForCausalLM(DexboticForCausalLM, ActionOutputForCausalLM):
                         key_states, value_states, layer_idx
                     )
                 else:
+                    cached_keys, cached_values = past_key_values[layer_idx]
                     key_states = torch.cat(
-                        [past_key_values.key_cache[layer_idx], key_states], dim=-2
+                        [cached_keys, key_states], dim=-2
                     )
                     value_states = torch.cat(
-                        [past_key_values.value_cache[layer_idx], value_states], dim=-2
+                        [cached_values, value_states], dim=-2
                     )
 
             attn_output, attn_weights = eager_attention_forward(

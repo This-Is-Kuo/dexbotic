@@ -11,7 +11,8 @@ from transformers import AutoTokenizer
 from dexbotic.constants import DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX
 from dexbotic.exp.base_exp import (ActionConfig, BaseExp,
                                    ComputeNormActionConfig, DataConfig,
-                                   ModelConfig, OptimizerConfig, TrainerConfig,
+                                   FSDPProfile, ModelConfig,
+                                   OptimizerConfig, TrainerConfig,
                                    InferenceConfig as BaseInferenceConfig)
 from dexbotic.model.cogact.cogact_arch import (CogActConfig, CogACTForCausalLM,
                                                CogActModel)
@@ -29,6 +30,12 @@ def parse_args():
             'train',
             'inference',
             'compute_norm_stats'])
+    parser.add_argument(
+        '--train-backend',
+        type=str,
+        default=None,
+        choices=['deepspeed', 'fsdp', 'fsdp2', 'ddp'],
+    )
     args, unknown = parser.parse_known_args()
     return args
 
@@ -40,6 +47,13 @@ class CogACTOptimizerConfig(OptimizerConfig):
 
 @dataclass
 class CogACTTrainerConfig(TrainerConfig):
+    fsdp_profile: FSDPProfile = field(
+        default_factory=lambda: FSDPProfile(
+            enabled=True,
+            transformer_layer_cls_to_wrap=("Qwen2DecoderLayer",),
+            cast_model_to_bf16_backends=("fsdp", "fsdp2"),
+        )
+    )
     num_train_epochs: int = field(default=5)
     save_steps: int = field(default=20000)
     per_device_train_batch_size: int = field(default=8)
@@ -98,6 +112,13 @@ class CogACTModelConfig(ModelConfig):
             }
             model = CogACTForCausalLM.from_pretrained(self.model_name_or_path)
             model.model.initialize_model(model_config_args)
+
+        # Under meta-device init (transformers>=5.0), CLIPVisionTower defers
+        # load_model(). Finalize non-parameter state (image_processor) now that
+        # weights have been loaded by from_pretrained.
+        vision_tower = model.model.mm_vision_tower
+        if getattr(vision_tower, "_meta_initialized", False) and not vision_tower.is_loaded:
+            vision_tower.load_model()
 
         self._freeze_model(model)
 
@@ -197,6 +218,8 @@ class CogACTExp(BaseExp):
 if __name__ == "__main__":
     args = parse_args()
     exp = CogACTExp()
+    if args.train_backend is not None:
+        exp.trainer_config.train_backend = args.train_backend
     if args.task == 'train':
         exp.train()
     elif args.task == 'inference':

@@ -46,6 +46,7 @@ from dexbotic.exp.base_exp import (
     ComputeNormActionConfig,
     Config,
     DataConfig,
+    FSDPProfile,
     ModelConfig,
     OPENAI_CLIP_PATH,
     OptimizerConfig,
@@ -235,6 +236,14 @@ class DM0OptimizerConfig(OptimizerConfig):
 
 @dataclass
 class DM0TrainerConfig(TrainerConfig):
+    fsdp_profile: FSDPProfile = field(
+        default_factory=lambda: FSDPProfile(
+            enabled=True,
+            cpu_ram_efficient_loading=False,
+            transformer_layer_cls_to_wrap=("Qwen3MLP",),
+            cast_model_to_bf16_backends=("fsdp",),
+        )
+    )
     model_max_length: int = field(default=200)
     bf16: bool = field(default=True)
     num_train_steps: int = field(default=30000)

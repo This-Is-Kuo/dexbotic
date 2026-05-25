@@ -93,12 +93,16 @@ class DM0Model(DexboticVLMModel):
 
     def embed_image(self, image: torch.Tensor) -> torch.Tensor:
         """Encode image using vision tower and projector."""
-        image_features = self.mm_vision_tower(
+        vision_features = self.mm_vision_tower(
             image.to(
                 device=self.mm_vision_tower.device, dtype=self.mm_vision_tower.dtype
             )
         )
-        image_features = self.mm_projector(image_features)
+        projector_dtype = getattr(getattr(self.mm_projector, "weight", None), "dtype", vision_features.dtype)
+        projector_device = getattr(getattr(self.mm_projector, "weight", None), "device", vision_features.device)
+        image_features = self.mm_projector(
+            vision_features.to(device=projector_device, dtype=projector_dtype)
+        )
         return image_features
 
     def embed_language_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
@@ -129,6 +133,9 @@ class DM0ForCausalLM(DexboticForCausalLM, ActionOutputForCausalLM):
     """DM0 model for causal language modeling with action prediction."""
 
     config_class = DM0Config
+    _tied_weights_keys = {
+        "lm_head.weight": "model.llm.embed_tokens.weight",
+    }
 
     def _real_init(self, config: DM0Config):
         self.model = DM0Model(config)
@@ -213,21 +220,18 @@ class DM0ForCausalLM(DexboticForCausalLM, ActionOutputForCausalLM):
         )
 
         if past_key_values is not None:
-            cache_length = (
-                len(past_key_values.key_cache)
-                if hasattr(past_key_values, "key_cache")
-                else 0
-            )
+            cache_length = len(past_key_values)
             if use_cache:
                 key_states, value_states = past_key_values.update(
                     key_states, value_states, layer_idx
                 )
             elif cache_length > layer_idx:
+                cached_keys, cached_values = past_key_values[layer_idx]
                 key_states = torch.cat(
-                    [past_key_values.key_cache[layer_idx], key_states], dim=-2
+                    [cached_keys, key_states], dim=-2
                 )
                 value_states = torch.cat(
-                    [past_key_values.value_cache[layer_idx], value_states], dim=-2
+                    [cached_values, value_states], dim=-2
                 )
 
         attn_output, _ = modeling_qwen3.eager_attention_forward(
@@ -320,18 +324,19 @@ class DM0ForCausalLM(DexboticForCausalLM, ActionOutputForCausalLM):
         padding_mask_list = []
         attn_mask_list = []
 
-        images = images.transpose(0, 1)
-        image_masks = image_masks.transpose(0, 1)
+        if images is not None:
+            images = images.transpose(0, 1)
+            image_masks = image_masks.transpose(0, 1)
 
-        for image, image_mask in zip(images, image_masks):
-            image_hidden_states = self.encode_images(image)
-            batch_size, num_img_tokens = image_hidden_states.shape[:2]
+            for image, image_mask in zip(images, image_masks):
+                image_hidden_states = self.encode_images(image)
+                batch_size, num_img_tokens = image_hidden_states.shape[:2]
 
-            hidden_states_list.append(image_hidden_states)
-            padding_mask_list.append(
-                image_mask.unsqueeze(1).expand(batch_size, num_img_tokens)
-            )
-            attn_mask_list += [1] * num_img_tokens
+                hidden_states_list.append(image_hidden_states)
+                padding_mask_list.append(
+                    image_mask.unsqueeze(1).expand(batch_size, num_img_tokens)
+                )
+                attn_mask_list += [1] * num_img_tokens
 
         if input_ids is not None:
             text_hidden_states = self.model.embed_language_tokens(input_ids)

@@ -9,23 +9,38 @@ class CLIPVisionTower(nn.Module):
         super().__init__()
 
         self.is_loaded = False
+        self._meta_initialized = False
 
         self.vision_tower_name = vision_tower
         self.select_layer = -2
 
-        if not delay_load:
+        if not delay_load and not torch.empty(0).is_meta:
             self.load_model()
         else:
             self.cfg_only = CLIPVisionConfig.from_pretrained(self.vision_tower_name)
+            if torch.empty(0).is_meta:
+                # Under meta-device context (transformers>=5.0 from_pretrained),
+                # from_pretrained is not allowed. Create module structure from
+                # config only; actual weights are filled by the outer state_dict load.
+                self.vision_tower = CLIPVisionModel(self.cfg_only)
+                self._meta_initialized = True
 
     def load_model(self):
         if self.is_loaded:
             return
         self.image_processor = CLIPImageProcessor.from_pretrained(
             self.vision_tower_name)
-        self.vision_tower = CLIPVisionModel.from_pretrained(self.vision_tower_name)
-        self.vision_tower.requires_grad_(False)
 
+        if getattr(self, "_meta_initialized", False):
+            # Weights were already loaded via outer from_pretrained state_dict;
+            # only finalize non-parameter state.
+            self.vision_tower.requires_grad_(False)
+        else:
+            self.vision_tower = CLIPVisionModel.from_pretrained(self.vision_tower_name)
+            self.vision_tower.requires_grad_(False)
+
+        if hasattr(self, "cfg_only"):
+            del self.cfg_only
         self.is_loaded = True
 
     def feature_select(self, image_forward_outs):

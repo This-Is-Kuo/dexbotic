@@ -25,6 +25,7 @@ from dexbotic.exp.base_exp import (
     ComputeNormActionConfig,
     Config,
     DataConfig,
+    FSDPProfile,
     ModelConfig,
     OptimizerConfig,
     TrainerConfig,
@@ -89,6 +90,12 @@ class Pi0OptimizerConfig(OptimizerConfig):
 
 @dataclass
 class Pi0TrainerConfig(TrainerConfig):
+    fsdp_profile: FSDPProfile = field(
+        default_factory=lambda: FSDPProfile(
+            enabled=True,
+            cpu_ram_efficient_loading=True,
+        )
+    )
     bf16: bool = field(default=True)
     num_train_steps: int = field(default=30000)
     save_steps: int = field(default=10000)

@@ -181,6 +181,7 @@ dexbotic/data/data_source/*.py
 !dexbotic/data/data_source/example.py
 !dexbotic/data/data_source/__init__.py
 !dexbotic/data/data_source/register.py
+!dexbotic/data/data_source/uninavid_official.py
 dexbotic/norm_assets
 
 # Local Codex / open-loop debug workspace

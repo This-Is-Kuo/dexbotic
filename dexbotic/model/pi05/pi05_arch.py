@@ -110,10 +110,21 @@ class Pi05Model(DexboticVLMModel):
 
 class Pi05ForCausalLM(DexboticForCausalLM, ActionOutputForCausalLM):
     config_class = Pi05Config
+    # Pi05 has no lm_head, so clear inherited tied-weights metadata from DexboticForCausalLM.
+    _tied_weights_keys = {}
 
     def _real_init(self, config: Pi05Config):
         self.model = Pi05Model(config)
         self.post_init()
+
+    def get_output_embeddings(self):
+        # Pi05 is an action diffusion model without vocab projection head.
+        # Returning None lets transformers.skip tie_weights for lm_head.
+        return None
+
+    def set_output_embeddings(self, new_embeddings):
+        # Keep API compatibility with PreTrainedModel.
+        return None
 
     def _inner_forward_mot(
         self,
@@ -189,11 +200,12 @@ class Pi05ForCausalLM(DexboticForCausalLM, ActionOutputForCausalLM):
                         key_states, value_states, layer_idx
                     )
                 else:
+                    cached_keys, cached_values = past_key_values[layer_idx]
                     key_states = torch.cat(
-                        [past_key_values.key_cache[layer_idx], key_states], dim=-2
+                        [cached_keys, key_states], dim=-2
                     )
                     value_states = torch.cat(
-                        [past_key_values.value_cache[layer_idx], value_states], dim=-2
+                        [cached_values, value_states], dim=-2
                     )
 
             attn_output, attn_weights = eager_attention_forward(

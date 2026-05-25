@@ -414,6 +414,7 @@ class DexboticVLMModel(DexboticPretrainedModel):
 
 class DexboticForCausalLM(DexboticPretrainedModel, GenerationMixin):
     config_class = DexboticConfig
+    _tied_weights_keys = {}
 
     def __init__(self, config: DexboticConfig):
         super().__init__(config)
@@ -425,6 +426,13 @@ class DexboticForCausalLM(DexboticPretrainedModel, GenerationMixin):
         self.model = DexboticVLMModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.post_init()
+
+    def get_output_embeddings(self):
+        return getattr(self, "lm_head", None)
+
+    def set_output_embeddings(self, new_embeddings):
+        if hasattr(self, "lm_head"):
+            self.lm_head = new_embeddings
 
     def forward(self,
                 input_ids: torch.LongTensor = None,

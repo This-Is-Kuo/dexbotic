@@ -53,6 +53,12 @@ def parse_args():
         default="train",
         choices=["train", "inference"],
     )
+    parser.add_argument(
+        "--train-backend",
+        type=str,
+        default=None,
+        choices=["deepspeed", "fsdp", "fsdp2", "ddp"],
+    )
     args, unknown = parser.parse_known_args()
     return args
 
@@ -389,6 +395,8 @@ class DM0Exp(_DM0Exp):
 if __name__ == "__main__":
     args = parse_args()
     exp = DM0Exp()
+    if args.train_backend is not None:
+        exp.trainer_config.train_backend = args.train_backend
     if args.task == "train":
         exp.train()
     elif args.task == "inference":

@@ -47,6 +47,7 @@ class CogActModel(DexboticVLMModel):
 
 class CogACTForCausalLM(DexboticForCausalLM, ActionOutputForCausalLM):
     config_class = CogActConfig
+    _tied_weights_keys = {}
 
     def _real_init(self, config: CogActConfig):
         self.model = CogActModel(config)

@@ -47,6 +47,12 @@ def parse_args():
         default="train",
         choices=["train", "inference", "compute_norm_stats"],
     )
+    parser.add_argument(
+        "--train-backend",
+        type=str,
+        default=None,
+        choices=["deepspeed", "fsdp", "fsdp2", "ddp"],
+    )
     args, unknown = parser.parse_known_args()
     return args
 
@@ -61,6 +67,7 @@ class Pi05ModelConfig(ModelConfig):
         return model
 
 
+@dataclass
 class Pi05TrainerConfig(Pi0TrainerConfig):
     model_max_length: int = field(default=200)
 
@@ -189,6 +196,8 @@ class Pi05Exp(BaseExp):
 if __name__ == "__main__":
     args = parse_args()
     exp = Pi05Exp()
+    if args.train_backend is not None:
+        exp.trainer_config.train_backend = args.train_backend
     if args.task == "train":
         exp.train()
     elif args.task == "inference":

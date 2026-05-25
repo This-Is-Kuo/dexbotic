@@ -134,6 +134,9 @@ class DM0ProgForCausalLM(DexboticForCausalLM, ActionOutputForCausalLM):
     """DM0 Prog model for causal language modeling with action and progress prediction."""
 
     config_class = DM0ProgConfig
+    _tied_weights_keys = {
+        "lm_head.weight": "model.llm.embed_tokens.weight",
+    }
 
     def _real_init(self, config: DM0ProgConfig):
         self.model = DM0ProgModel(config)
@@ -218,21 +221,18 @@ class DM0ProgForCausalLM(DexboticForCausalLM, ActionOutputForCausalLM):
         )
 
         if past_key_values is not None:
-            cache_length = (
-                len(past_key_values.key_cache)
-                if hasattr(past_key_values, "key_cache")
-                else 0
-            )
+            cache_length = len(past_key_values)
             if use_cache:
                 key_states, value_states = past_key_values.update(
                     key_states, value_states, layer_idx
                 )
             elif cache_length > layer_idx:
+                cached_keys, cached_values = past_key_values[layer_idx]
                 key_states = torch.cat(
-                    [past_key_values.key_cache[layer_idx], key_states], dim=-2
+                    [cached_keys, key_states], dim=-2
                 )
                 value_states = torch.cat(
-                    [past_key_values.value_cache[layer_idx], value_states], dim=-2
+                    [cached_values, value_states], dim=-2
                 )
 
         attn_output, _ = modeling_qwen3.eager_attention_forward(

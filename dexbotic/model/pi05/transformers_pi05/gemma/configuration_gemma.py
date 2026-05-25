@@ -112,6 +112,8 @@ class AdaRMSGemmaConfig(PretrainedConfig):
         bos_token_id=2,
         tie_word_embeddings=True,
         rope_theta=10000.0,
+        rope_parameters=None,
+        rope_scaling=None,
         attention_bias=False,
         attention_dropout=0.0,
         use_adarms: bool = False,
@@ -132,6 +134,12 @@ class AdaRMSGemmaConfig(PretrainedConfig):
         self.rms_norm_eps = rms_norm_eps
         self.use_cache = use_cache
         self.rope_theta = rope_theta
+        # transformers>=5.0 reads rope_type from config.rope_parameters;
+        # older versions read from config.rope_scaling.  Provide a valid
+        # default so GemmaRotaryEmbedding works across all versions.
+        _default_rope = {"rope_theta": rope_theta, "rope_type": "default"}
+        self.rope_parameters = rope_parameters or rope_scaling or _default_rope
+        self.rope_scaling = self.rope_parameters
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
         self.use_adarms = use_adarms

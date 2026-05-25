@@ -3,15 +3,23 @@ from typing import Callable, List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 from loguru import logger
-from transformers.cache_utils import Cache
+
+try:
+    from transformers import initialization as init
+except ImportError:
+    init = None
+from transformers.cache_utils import Cache, DynamicCache, StaticCache
 from transformers.integrations.flex_attention import make_flex_block_causal_mask
+from transformers.modeling_attn_mask_utils import AttentionMaskConverter
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
-from transformers.models.gemma.modeling_gemma import (
-    AttentionMaskConverter,
+from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
     CausalLMOutputWithPast,
-    DynamicCache,
+    SequenceClassifierOutputWithPast,
+    TokenClassifierOutput,
+)
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+from transformers.models.gemma.modeling_gemma import (
     GemmaAttention,
     GemmaForCausalLM,
     GemmaForSequenceClassification,
@@ -19,15 +27,16 @@ from transformers.models.gemma.modeling_gemma import (
     GemmaMLP,
     GemmaPreTrainedModel,
     GemmaRotaryEmbedding,
-    KwargsForCausalLM,
-    SequenceClassifierOutputWithPast,
-    StaticCache,
-    TokenClassifierOutput,
     apply_rotary_pos_emb,
     eager_attention_forward,
 )
 from transformers.processing_utils import Unpack
 from transformers.utils import can_return_tuple, is_torch_flex_attn_available
+
+try:
+    from transformers.models.gemma.modeling_gemma import KwargsForCausalLM
+except ImportError:
+    from transformers.utils import TransformersKwargs as KwargsForCausalLM
 
 from .configuration_gemma import AdaRMSGemmaConfig
 
@@ -66,7 +75,7 @@ class GemmaRMSNorm(nn.Module):
         if cond is None or self.dense is None:
             # regular RMSNorm
             # scale by learned parameter in float32 (matches source implementation)
-            normed_inputs = normed_inputs * (1.0 + self.weight.float())
+            normed_inputs = normed_inputs * (1.0 + self.weight.to(torch.float32))
             # return in original dtype with None gate
             return normed_inputs.to(dtype), None
 
@@ -263,17 +272,34 @@ class AdaRMSGemmaPreTrainedModel(GemmaPreTrainedModel):
 
     def _init_weights(self, module):
         std = self.config.initializer_range
-        if isinstance(module, nn.Linear):
-            module.weight.data.normal_(mean=0.0, std=std)
-            if module.bias is not None:
-                module.bias.data.zero_()
-        elif isinstance(module, nn.Embedding):
-            module.weight.data.normal_(mean=0.0, std=std)
-            if module.padding_idx is not None:
-                module.weight.data[module.padding_idx].zero_()
-        elif isinstance(module, GemmaRMSNorm):
-            if hasattr(module, "weight"):
-                module.weight.data.fill_(1.0)
+        if init is not None:
+            # transformers>=5.0: init.* wrappers respect _is_hf_initialized,
+            # so checkpoint weights are never overwritten.
+            # Skip super() for GemmaRMSNorm because GemmaPreTrainedModel
+            # assumes all RMSNorm have .weight, but adaptive GemmaRMSNorm
+            # (cond_dim != None) uses .dense instead and has no .weight.
+            if not isinstance(module, GemmaRMSNorm):
+                # Delegates to GemmaPreTrainedModel -> PreTrainedModel,
+                # which handles RotaryEmbedding inv_freq recomputation
+                # after meta-device init (non-persistent buffer, not in
+                # checkpoint).
+                super()._init_weights(module)
+            else:
+                if hasattr(module, "weight"):
+                    init.zeros_(module.weight)
+        else:
+            # transformers<5.0: direct ops, checkpoint loads after _init_weights
+            if isinstance(module, nn.Linear):
+                module.weight.data.normal_(mean=0.0, std=std)
+                if module.bias is not None:
+                    module.bias.data.zero_()
+            elif isinstance(module, nn.Embedding):
+                module.weight.data.normal_(mean=0.0, std=std)
+                if module.padding_idx is not None:
+                    module.weight.data[module.padding_idx].zero_()
+            elif isinstance(module, GemmaRMSNorm):
+                if hasattr(module, "weight"):
+                    module.weight.data.zero_()
 
 
 class AdaRMSGemmaModel(AdaRMSGemmaPreTrainedModel):

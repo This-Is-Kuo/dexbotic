@@ -223,6 +223,17 @@ def policy_identity(p=0.5):
     return A.Compose([])
 
 
+def policy_uninavid(p=0.05):
+    """Mild per-frame color jitter matching the original UniNaVid augmentation.
+
+    brightness/contrast/saturation each uniformly sampled from (0.8, 1.2).
+    """
+    aug = [
+        A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0, p=p),
+    ]
+    return A.Compose(aug)
+
+
 NAME2AUG = {
     'v1': policy_v1,
     'v2': policy_v2,
@@ -232,6 +243,7 @@ NAME2AUG = {
     'identity': policy_identity,
     'dm0': policy_dm0,
     'color_dm0': policy_color_dm0,
+    'uninavid': policy_uninavid,
 }
 
 

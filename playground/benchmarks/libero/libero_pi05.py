@@ -34,7 +34,7 @@ from dexbotic.exp.pi05_exp import Pi0DataConfig as _Pi0DataConfig
 from dexbotic.exp.pi05_exp import Pi0InferenceConfig as _Pi0InferenceConfig
 from dexbotic.exp.pi05_exp import Pi0OptimizerConfig as _Pi0OptimizerConfig
 from dexbotic.exp.pi05_exp import Pi0TokenizerConfig as _Pi0TokenizerConfig
-from dexbotic.exp.pi05_exp import Pi0TrainerConfig as _Pi0TrainerConfig
+from dexbotic.exp.pi05_exp import Pi05TrainerConfig as _Pi05TrainerConfig
 from dexbotic.exp.pi05_exp import Pi05Exp as _Pi05Exp
 from dexbotic.exp.pi05_exp import Pi05ModelConfig as _Pi05ModelConfig
 from dexbotic.model.pi05.pi05_arch import Pi05ForCausalLM
@@ -49,6 +49,12 @@ def parse_args():
         default="train",
         choices=["train", "inference", "compute_norm_stats"],
     )
+    parser.add_argument(
+        "--train-backend",
+        type=str,
+        default=None,
+        choices=["deepspeed", "fsdp", "fsdp2", "ddp"],
+    )
     args, unknown = parser.parse_known_args()
     return args
 
@@ -62,8 +68,10 @@ class Pi05OptimizerConfig(_Pi0OptimizerConfig):
 
 
 @dataclass
-class Pi05TrainerConfig(_Pi0TrainerConfig):
+class Pi05TrainerConfig(_Pi05TrainerConfig):
     wandb_project: str = field(default="dexbotic-pi05-libero-all")
+    use_raw_backward: bool = field(default=True)
+    use_raw_warmup: bool = field(default=True)
     bf16: bool = field(default=True)
     num_train_steps: int = field(default=30000)
     save_steps: int = field(default=5000)
@@ -254,6 +262,8 @@ class Pi05Exp(_Pi05Exp):
 if __name__ == "__main__":
     args = parse_args()
     exp = Pi05Exp()
+    if args.train_backend is not None:
+        exp.trainer_config.train_backend = args.train_backend
     if args.task == "train":
         exp.train()
     elif args.task == "inference":

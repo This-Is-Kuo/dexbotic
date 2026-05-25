@@ -455,7 +455,7 @@ class MemVLAExp(BaseExp):
         # step 4: build trainer
         trainer_kwargs = {
             "model": self.model,
-            "tokenizer": self.tokenizer,
+            "processing_class": self.tokenizer,
             "exp_config": self,
             "train_dataset": train_dataset,
             "data_collator": data_collator,

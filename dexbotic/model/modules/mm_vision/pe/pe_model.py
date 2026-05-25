@@ -69,8 +69,8 @@ class Rope2D(nn.Module):
         self.freqs_for = freqs_for
         self.max_freq = max_freq
         self.num_freqs = num_freqs
-        cache = self._compute_2d_freqs()
-        self.register_buffer("freqs_cache", cache, persistent=False)
+        self._freqs_runtime_cache = OrderedDict()
+        self._max_runtime_cache_entries = 4
 
     def _compute_inv_freq(self, base: Union[int, float], dim: int) -> torch.Tensor:
         if self.freqs_for == "lang":
@@ -90,39 +90,50 @@ class Rope2D(nn.Module):
         freqs = repeat(freqs, "... n -> ... (n r)", r=2)
         return freqs
 
-    def _compute_2d_freqs(self) -> torch.Tensor:
-        grid_h_range = torch.arange(self.max_grid_height, dtype=torch.float)
-        grid_w_range = torch.arange(self.max_grid_width, dtype=torch.float)
+    def _compute_2d_freqs(
+        self,
+        grid_height: int,
+        grid_width: int,
+        device: Optional[torch.device] = None,
+    ) -> torch.Tensor:
+        grid_h_range = torch.arange(grid_height, dtype=torch.float, device=device)
+        grid_w_range = torch.arange(grid_width, dtype=torch.float, device=device)
         if self.use_cls_token:
             grid_h_range += 1
             grid_w_range += 1
         inv_freq = self._compute_inv_freq(self.theta, self.dim // 2)
+        if device is not None:
+            inv_freq = inv_freq.to(device=device)
         freqs_h = self._compute_freqs(grid_h_range, inv_freq)[:, None].expand(
-            self.max_grid_height, self.max_grid_width, -1
+            grid_height, grid_width, -1
         )
         freqs_w = self._compute_freqs(grid_w_range, inv_freq)[None, :].expand(
-            self.max_grid_height, self.max_grid_width, -1
+            grid_height, grid_width, -1
         )
-        freqs = torch.cat([freqs_w, freqs_h], dim=-1).reshape(
-            self.max_grid_height * self.max_grid_width, -1
-        )
+        freqs = torch.cat([freqs_w, freqs_h], dim=-1).reshape(grid_height * grid_width, -1)
         if self.use_cls_token:
-            freqs = torch.cat([torch.zeros(1, freqs.shape[-1]), freqs], dim=0)
+            freqs = torch.cat([torch.zeros(1, freqs.shape[-1], device=device), freqs], dim=0)
         freqs = freqs[None, None, ...]
         return freqs
 
-    def forward(self, q: torch.Tensor, k: torch.Tensor, grid_hw: tuple[int, int]):
-        if grid_hw[0] != self.max_grid_height or grid_hw[1] != self.max_grid_width:
-            rows = torch.arange(grid_hw[0], device=q.device).view(-1, 1)
-            cols = torch.arange(grid_hw[1], device=q.device).view(1, -1)
-            positions = (rows * self.max_grid_width + cols).reshape(-1).to(torch.long)
-            if self.use_cls_token:
-                positions = torch.cat(
-                    [torch.zeros(1, device=q.device), positions + 1], dim=0
-                ).to(torch.long)
-            freqs = self.freqs_cache.index_select(2, positions)
+    def _get_runtime_freqs(self, grid_height: int, grid_width: int, device: torch.device) -> torch.Tensor:
+        cache_key = (grid_height, grid_width, device.type, device.index)
+        freqs = self._freqs_runtime_cache.get(cache_key)
+        if freqs is None or freqs.device != device:
+            with torch.no_grad():
+                freqs = self._compute_2d_freqs(grid_height, grid_width, device=device)
+            self._freqs_runtime_cache[cache_key] = freqs
+            self._freqs_runtime_cache.move_to_end(cache_key)
+            while len(self._freqs_runtime_cache) > self._max_runtime_cache_entries:
+                self._freqs_runtime_cache.popitem(last=False)
         else:
-            freqs = self.freqs_cache
+            self._freqs_runtime_cache.move_to_end(cache_key)
+        return freqs
+
+    def forward(self, q: torch.Tensor, k: torch.Tensor, grid_hw: tuple[int, int]):
+        # Cache frequencies outside module state so FSDP2 wrap/prepare does not touch them,
+        # while still avoiding per-forward recomputation on the common same-device/same-grid path.
+        freqs = self._get_runtime_freqs(grid_hw[0], grid_hw[1], q.device)
         q = apply_rotary_emb(freqs, q)
         k = apply_rotary_emb(freqs, k)
         return q, k
@@ -220,7 +231,11 @@ class SelfAttention(nn.Module):
         )
         self.scale = self.head_dim ** (-0.5)
 
-    def forward(self, x, grid_hw: tuple[int, int]):
+    def forward(
+        self,
+        x,
+        grid_hw: tuple[int, int],
+    ):
         _, _, embed_dim = x.shape
         proj = F.linear(x, self.in_proj_weight, self.in_proj_bias)
 
@@ -521,8 +536,7 @@ class PerceptionEncoderWithDownsample(nn.Module):
         batch, _, h, w = x.shape
         grid_h, grid_w = h // self.patch_size, w // self.patch_size
 
-        x = self.conv1(x)
-        x = x.permute(0, 2, 3, 1).reshape(batch, -1, self.width)
+        x = self.conv1(x).permute(0, 2, 3, 1).reshape(batch, -1, self.width)
 
         if self.use_cls_token:
             x = torch.cat(
@@ -531,7 +545,8 @@ class PerceptionEncoderWithDownsample(nn.Module):
             )
 
         if self.use_abs_posemb:
-            x = x + self.sample_abs_posemb(grid_h, grid_w)
+            posemb = self.sample_abs_posemb(grid_h, grid_w)
+            x = x + posemb
 
         if self.transformer.resblocks[0].attn.in_proj_weight.dtype == torch.bfloat16:
             x = x.to(torch.bfloat16)

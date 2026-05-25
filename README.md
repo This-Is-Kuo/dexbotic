@@ -29,6 +29,8 @@
 
 ## 🔥 News
 
+- **[2026-05-15]** Supported [FSDP2 training backend](docs/FSDP2.md) for faster distributed training.
+- **[2026-05-09]** Supported [Uni-NaVid](playground/example_uninavid_exp.py).
 - **[2026-04-27]** Supported [RLinf as an RL backend](docs/RLinfAsRLBackend.md) for RL post-training.
 - **[2026-03-30]** Supported [GR00TN1](playground/benchmarks/libero/libero_gr00tn1.py).
 - **[2026-03-30]** Added [Co-training](dexbotic/exp/hybrid_pi05_exp.py) capability for the Pi05 model.

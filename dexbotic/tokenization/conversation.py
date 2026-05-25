@@ -248,9 +248,24 @@ conv_qwen2 = Conversation(
     sep2="<|im_end|>",
 )
 
+# UniNaVid uses a Vicuna-style USER/ASSISTANT template
+conv_vicuna = Conversation(
+    system="A chat between a curious user and an artificial intelligence assistant. "
+    "The assistant gives helpful, detailed, and polite answers to the user's questions.",
+    roles=("USER", "ASSISTANT"),
+    version="vicuna",
+    messages=(),
+    offset=0,
+    sep_style=SeparatorStyle.TWO,
+    sep=" ",
+    sep2="</s>",
+)
+
 conv_templates = {
     "dexbotic": conv_dexbotic,
+    "cogact": conv_dexbotic,
     "step": conv_step,
     "llama_3": llama_3_chat,
     "qwen2-chat": conv_qwen2,
+    "vicuna": conv_vicuna,
 }

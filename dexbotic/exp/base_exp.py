@@ -18,6 +18,7 @@ from easydict import EasyDict
 from loguru import logger
 from torch.utils.data import DataLoader
 from transformers import AutoImageProcessor, BaseImageProcessor, AutoTokenizer
+from transformers.trainer_utils import get_last_checkpoint
 from transformers.trainer_pt_utils import get_parameter_names
 try:
     from transformers.trainer import ALL_LAYERNORM_LAYERS
@@ -39,6 +40,12 @@ from dexbotic.data.dataset.transform.language import (AddPromptTemplate,
                                                       ReplaceAnswer,
                                                       defalut_prompt_template)
 from dexbotic.data.dataset.transform.multimodal import LoadMultiModal
+from dexbotic.exp.backend_resolver import (
+    FSDPProfile,
+    apply_backend_defaults,
+    BackendResolution,
+    resolve_backend_mode,
+)
 from dexbotic.exp.trainer import (DexboticTrainer,
                                   safe_save_model_for_hf_trainer)
 from dexbotic.exp.utils import NumpyEncoder, enter_debug_mode
@@ -226,7 +233,12 @@ class TrainerConfig(Config):
     - tune_mm_mlp_adapter: Whether to enter mm_mlp_adapter-only training mode
     """
 
+    train_backend: str = field(default='deepspeed')
     deepspeed: Optional[str] = field(default='./script/deepspeed/zero3.json')
+    fsdp: Optional[str] = field(default=None)
+    fsdp_config: Optional[dict] = field(default=None)
+    fsdp_version: Optional[int] = field(default=None)
+    fsdp_profile: FSDPProfile = field(default_factory=FSDPProfile)
     output_dir: Optional[str] = field(default=None)
 
     num_train_epochs: int = field(default=1)
@@ -258,7 +270,16 @@ class TrainerConfig(Config):
 
     tune_mm_mlp_adapter: bool = field(default=False)
 
+    def ensure_backend_defaults(self) -> None:
+        """Populate backend-specific defaults lazily when a backend is selected."""
+        apply_backend_defaults(self)
+
     def __post_init__(self):
+        if self.train_backend not in {'deepspeed', 'fsdp', 'fsdp2', 'ddp'}:
+            raise ValueError(
+                f'Unsupported train_backend: {self.train_backend}. '
+                'Expected one of: deepspeed, fsdp, fsdp2, ddp.'
+            )
         if self.output_dir is not None:
             self.run_name = os.path.basename(self.output_dir)
         if self.wandb_project is not None:
@@ -777,6 +798,166 @@ class BaseExp(Config):
     tokenizer_config: TokenizerConfig = field(default_factory=TokenizerConfig)
     
     logger_level: str = field(default='INFO')
+    backend_resolution: Optional[BackendResolution] = field(
+        default=None, init=False, repr=False
+    )
+
+    def _log_backend_startup_summary(self) -> None:
+        if self.local_rank != 0 or self.backend_resolution is None:
+            return
+
+        resolution = self.backend_resolution
+        normalized_fsdp_config = resolution.normalized_fsdp_config or {}
+        fsdp_version = normalized_fsdp_config.get(
+            "fsdp_version", normalized_fsdp_config.get("version")
+        )
+        package_versions = resolution.package_versions
+
+        logger.info(
+            "Backend startup summary: requested_backend={}, resolved_mode={}, fsdp_version={}, plugin_kwargs={}, torch={}, transformers={}, accelerate={}",
+            resolution.requested_backend,
+            resolution.resolved_mode,
+            fsdp_version,
+            resolution.plugin_kwargs,
+            package_versions.torch if package_versions else torch.__version__,
+            package_versions.transformers if package_versions else transformers.__version__,
+            package_versions.accelerate if package_versions else "unknown",
+        )
+
+    def _validate_train_backend(self) -> None:
+        self.trainer_config.ensure_backend_defaults()
+        self.backend_resolution = resolve_backend_mode(self.trainer_config)
+
+        if self.local_rank == 0:
+            logger.info(
+                "Resolved training backend: requested_backend={}, resolved_mode={}, framework={}",
+                self.backend_resolution.requested_backend,
+                self.backend_resolution.resolved_mode,
+                self.backend_resolution.framework,
+            )
+            self._log_backend_startup_summary()
+            for warning in self.backend_resolution.warnings:
+                logger.warning("Backend resolver: {}", warning)
+
+    def _is_fsdp_compatible_checkpoint(self, checkpoint_dir: str) -> bool:
+        """Check if checkpoint is compatible with FSDP resume.
+
+        Both SHARDED_STATE_DICT (pytorch_model_fsdp_*/) and
+        FULL_STATE_DICT (model.safetensors / model-*.safetensors) layouts
+        can be resumed by HF Trainer under FSDP.
+        """
+        try:
+            from transformers.trainer import FSDP_MODEL_NAME
+        except ImportError:
+            FSDP_MODEL_NAME = "pytorch_model_fsdp"
+
+        checkpoint_path = pathlib.Path(checkpoint_dir)
+        if not checkpoint_path.is_dir():
+            return False
+
+        for child in checkpoint_path.iterdir():
+            # SHARDED_STATE_DICT layout
+            if child.is_dir() and FSDP_MODEL_NAME in child.name:
+                return True
+            # FULL_STATE_DICT layout (safetensors or bin)
+            if child.name == "model.safetensors" or child.name == "pytorch_model.bin":
+                return True
+            if child.name.startswith("model-") and child.name.endswith(".safetensors"):
+                return True
+        return (checkpoint_path / f"{FSDP_MODEL_NAME}.bin").is_file()
+
+    def _resolve_auto_resume_checkpoint(self) -> Optional[str]:
+        output_dir = self.trainer_config.output_dir
+        if output_dir is None or not os.path.isdir(output_dir):
+            return None
+
+        last_checkpoint = get_last_checkpoint(output_dir)
+        if last_checkpoint is None:
+            return None
+
+        if (
+            self.backend_resolution is not None
+            and self.backend_resolution.is_fsdp_backend
+            and not self._is_fsdp_compatible_checkpoint(last_checkpoint)
+        ):
+            logger.warning(
+                "Skipping auto-resume for FSDP backend because checkpoint {} has no recognizable model weights.",
+                last_checkpoint,
+            )
+            return None
+
+        return last_checkpoint
+
+    def _log_fsdp_runtime_state(self) -> None:
+        if self.local_rank != 0:
+            return
+
+        import accelerate
+
+        logger.info("torch: {}", torch.__version__)
+        logger.info("transformers: {}", transformers.__version__)
+        logger.info("accelerate: {}", accelerate.__version__)
+
+        if self.backend_resolution is not None:
+            logger.info(
+                "backend_resolution = {}",
+                {
+                    "requested_backend": self.backend_resolution.requested_backend,
+                    "resolved_mode": self.backend_resolution.resolved_mode,
+                    "framework": self.backend_resolution.framework,
+                },
+            )
+
+        logger.info(
+            "is_fsdp_enabled = {}",
+            getattr(self.trainer, "is_fsdp_enabled", None),
+        )
+        logger.info(
+            "distributed_type = {}",
+            self.trainer.accelerator.distributed_type,
+        )
+
+        fsdp_plugin = getattr(self.trainer.accelerator.state, "fsdp_plugin", None)
+        logger.info("fsdp_plugin = {}", fsdp_plugin)
+        if fsdp_plugin is not None:
+            logger.info(
+                "fsdp_version = {}", getattr(fsdp_plugin, "fsdp_version", None)
+            )
+
+        try:
+            from torch.distributed._tensor import DTensor
+            has_dtensor = any(
+                isinstance(param, DTensor) for param in self.trainer.model.parameters()
+            )
+            logger.info("has DTensor param = {}", has_dtensor)
+        except Exception as e:
+            logger.info("DTensor check failed: {}", e)
+            return
+
+        try:
+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP1
+        except Exception as e:
+            logger.info("FSDP wrapper check failed: {}", e)
+            return
+
+        logger.info(
+            "is FSDP1 wrapper = {}",
+            isinstance(self.trainer.model, FSDP1),
+        )
+        logger.info("has reshard = {}", hasattr(self.trainer.model, "reshard"))
+        logger.info("has unshard = {}", hasattr(self.trainer.model, "unshard"))
+        logger.info("model type = {}", type(self.trainer.model))
+
+    def _apply_fsdp_model_dtype(self) -> None:
+        profile = self.trainer_config.fsdp_profile
+        if self.trainer_config.train_backend not in profile.cast_model_to_bf16_backends:
+            return
+        if self.local_rank == 0:
+            logger.info(
+                "Casting model to bfloat16 for {} backend",
+                self.trainer_config.train_backend,
+            )
+        self.model.to(dtype=torch.bfloat16)
 
     def _initialize_train(self):
         self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -785,6 +966,8 @@ class BaseExp(Config):
         if self.local_rank != 0:
             logger.remove()
             logger.add(lambda msg: None)
+
+        self._validate_train_backend()
 
         # Step 0: compute norm stats
         self._auto_compute_norm_stats()
@@ -817,13 +1000,14 @@ class BaseExp(Config):
         # step 4: build trainer
         trainer_kwargs = {
             "model": self.model,
-            "tokenizer": self.tokenizer,
+            "processing_class": self.tokenizer,
             "exp_config": self,
             "train_dataset": train_dataset,
             "data_collator": data_collator,
         }
         trainer = DexboticTrainer(**trainer_kwargs)
         self.trainer = trainer
+        self._log_fsdp_runtime_state()
 
         # step 5: save action norm config
         if self.local_rank == 0 and hasattr(
@@ -835,6 +1019,8 @@ class BaseExp(Config):
             action_norm_config = train_dataset.action_process_func.statistic_mapping
             with open(os.path.join(self.trainer_config.output_dir, "norm_stats.json"), "w") as f:
                 json.dump(action_norm_config, f, indent=2, cls=NumpyEncoder)
+
+        self._apply_fsdp_model_dtype()
 
     def _auto_compute_norm_stats(self) -> None:
         if not self.data_config.auto_norm or self.data_config.action_config.statistic_mapping is not None:
@@ -867,19 +1053,28 @@ class BaseExp(Config):
     def train(self):
         self._initialize_train()
 
-        if list(pathlib.Path(self.trainer_config.output_dir).glob("checkpoint-*")):
-            self.trainer.train(resume_from_checkpoint=True)
-        else:
-            self.trainer.train()
+        try:
+            resume_checkpoint = self._resolve_auto_resume_checkpoint()
+            if resume_checkpoint is not None:
+                logger.info("Resuming training from checkpoint {}", resume_checkpoint)
+                self.trainer.train(resume_from_checkpoint=resume_checkpoint)
+            else:
+                self.trainer.train()
 
-        self.trainer.save_state()
-        self.model.config.use_cache = True
-        self.model.model.llm.config.use_cache = True
-        safe_save_model_for_hf_trainer(
-            trainer=self.trainer,
-            output_dir=self.trainer_config.output_dir)
-        logger.info(
-            f"Training completed and model saved to {self.trainer_config.output_dir}")
+            self.trainer.save_state()
+            self.model.config.use_cache = True
+            self.model.model.llm.config.use_cache = True
+            safe_save_model_for_hf_trainer(
+                trainer=self.trainer,
+                output_dir=self.trainer_config.output_dir)
+            logger.info(
+                f"Training completed and model saved to {self.trainer_config.output_dir}")
+        finally:
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                try:
+                    torch.distributed.destroy_process_group()
+                except Exception as exc:
+                    logger.warning("Failed to destroy process group cleanly: {}", exc)
 
 
 if __name__ == "__main__":
