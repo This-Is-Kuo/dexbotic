@@ -961,6 +961,10 @@ class BaseExp(Config):
 
     def _initialize_train(self):
         self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        if torch.cuda.is_available():
+            device_count = torch.cuda.device_count()
+            if device_count > 0:
+                torch.cuda.set_device(self.local_rank % device_count)
 
         logger.info(f"Local rank: {self.local_rank}")
         if self.local_rank != 0:

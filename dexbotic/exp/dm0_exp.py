@@ -76,6 +76,10 @@ class DM0TokenizerConfig(TokenizerConfig):
 
 @dataclass
 class DM0ComputeNormActionConfig(ComputeNormActionConfig):
+    class _OfflineImageProcessor:
+        size = {"height": 336, "width": 336}
+        crop_size = {"height": 336, "width": 336}
+
     def compute_norm_stats(self, dataset_name: str) -> None:
         self.norm_save_path = os.path.join(
             os.path.dirname(self.norm_save_path),
@@ -118,9 +122,7 @@ class DM0ComputeNormActionConfig(ComputeNormActionConfig):
                     dataset_name=dataset_name,
                     num_images=1,
                     data_keys=["action", "state"],
-                    image_processor=AutoImageProcessor.from_pretrained(
-                        OPENAI_CLIP_PATH
-                    ),
+                    image_processor=self._OfflineImageProcessor(),
                     image_aspect_ratio=None,
                     aug_policy=None,
                 ),

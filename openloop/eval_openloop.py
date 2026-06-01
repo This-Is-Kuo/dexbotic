@@ -32,17 +32,20 @@ import importlib.util
 import inspect
 import json
 import logging
+import math
+import os
 import pathlib
 import random
+import sys
 from collections import defaultdict
 from dataclasses import dataclass
 from types import ModuleType
 from typing import Any
 
-import matplotlib
+PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Subset
@@ -56,6 +59,7 @@ DEFAULT_NUM_BATCHES = 50
 DEFAULT_NUM_WORKERS = 4
 DEFAULT_DIFFUSION_STEPS = 10
 DEFAULT_CHUNK_MERGE_EXP_DECAY = 0.7
+EVAL_OUTPUT_ROOT = pathlib.Path("/mnt/datadisk/guoyaokun/checkpoints/DM0/eval")
 
 
 @dataclass(frozen=True)
@@ -84,6 +88,13 @@ def _parse_csv_ints(value: str | None) -> list[int]:
     return [int(part.strip()) for part in value.split(",") if part.strip()]
 
 
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    return int(value)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", required=True, help="Checkpoint directory.")
@@ -108,15 +119,47 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional norm_stats.json path. Defaults to <checkpoint>/norm_stats.json when available.",
     )
-    parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
-    parser.add_argument("--num-batches", type=int, default=DEFAULT_NUM_BATCHES)
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=_env_int(
+            "DEXBOTIC_OPENLOOP_BATCH_SIZE",
+            _env_int("DEXBOTIC_EVAL_BATCH_SIZE", DEFAULT_BATCH_SIZE),
+        ),
+    )
+    parser.add_argument("--num-batches", type=int, default=_env_int("DEXBOTIC_EVAL_NUM_BATCHES", 0))
     parser.add_argument("--num-workers", type=int, default=DEFAULT_NUM_WORKERS)
     parser.add_argument("--diffusion-steps", type=int, default=DEFAULT_DIFFUSION_STEPS)
+    parser.add_argument(
+        "--inference-stride",
+        type=int,
+        default=_env_int(
+            "DEXBOTIC_OPENLOOP_STRIDE",
+            _env_int("DEXBOTIC_EVAL_INFERENCE_STRIDE", 1),
+        ),
+        help=(
+            "Evaluate one observation every N frames per episode. "
+            "Use 1 for legacy per-frame open-loop inference; use 0 to infer the stride "
+            "from model config.chunk_size."
+        ),
+    )
     parser.add_argument(
         "--single-gpu-id",
         type=int,
         default=None,
         help="Pin inference to a single CUDA device id and avoid model auto-sharding across multiple GPUs.",
+    )
+    parser.add_argument(
+        "--max-samples",
+        type=int,
+        default=_env_int("DEXBOTIC_OPENLOOP_MAX_SAMPLES", 0),
+        help="Maximum sampled observations to evaluate after stride/episode filtering. 0 means no limit.",
+    )
+    parser.add_argument(
+        "--max-episodes",
+        type=int,
+        default=_env_int("DEXBOTIC_OPENLOOP_MAX_EPISODES", 0),
+        help="Maximum episodes to evaluate before stride filtering. 0 means no limit.",
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--shuffle", action="store_true", help="Shuffle eval dataloader.")
@@ -193,6 +236,11 @@ def parse_args() -> argparse.Namespace:
         choices=["pred", "post"],
         default="pred",
         help="Whether the raw plot should visualize the original prediction or the postprocessed prediction.",
+    )
+    parser.add_argument(
+        "--no-plots",
+        action="store_true",
+        help="Skip matplotlib plot generation and only save metrics/arrays.",
     )
     return parser.parse_args()
 
@@ -279,6 +327,10 @@ def _resolve_norm_stats_path(args: argparse.Namespace, checkpoint_dir: pathlib.P
     if args.norm_stats is not None:
         return str(pathlib.Path(args.norm_stats).expanduser().resolve())
 
+    env_norm_stats = os.getenv("DEXBOTIC_NORM_STATS_PATH")
+    if env_norm_stats:
+        return str(pathlib.Path(env_norm_stats).expanduser().resolve())
+
     default_path = checkpoint_dir / "norm_stats.json"
     if default_path.exists():
         return str(default_path)
@@ -304,7 +356,30 @@ def _prepare_exp(args: argparse.Namespace, checkpoint_dir: pathlib.Path) -> Base
     if args.dataset_name is not None:
         exp.data_config.dataset_name = args.dataset_name
 
-    if args.single_gpu_id is not None:
+    eval_device_map = os.getenv("DEXBOTIC_EVAL_DEVICE_MAP", "single").strip().lower()
+    if eval_device_map in {"single", "none", "false", "0"}:
+        exp.inference_config.device_map = None
+        if args.single_gpu_id is not None:
+            exp.inference_config.cuda_device = args.single_gpu_id
+    elif eval_device_map == "auto":
+        exp.inference_config.device_map = "auto"
+        visible_devices = os.getenv("CUDA_VISIBLE_DEVICES", "")
+        exposed_gpu_count = len([part for part in visible_devices.split(",") if part.strip()])
+        if exposed_gpu_count > 1:
+            logging.warning(
+                "DEXBOTIC_EVAL_DEVICE_MAP=auto with multiple visible GPUs (%s) may split DM0 "
+                "across GPUs and can trigger cross-device tensor errors.",
+                visible_devices,
+            )
+        else:
+            logging.warning(
+                "DEXBOTIC_EVAL_DEVICE_MAP=auto may split DM0 across GPUs and can trigger "
+                "cross-device tensor errors."
+            )
+    else:
+        raise ValueError(f"Unsupported DEXBOTIC_EVAL_DEVICE_MAP={eval_device_map}")
+
+    if args.single_gpu_id is not None and eval_device_map == "auto":
         target_device_map = {"": f"cuda:{args.single_gpu_id}"}
         exp.inference_config.cuda_device = args.single_gpu_id
         exp.inference_config.device_map = target_device_map
@@ -312,6 +387,8 @@ def _prepare_exp(args: argparse.Namespace, checkpoint_dir: pathlib.Path) -> Base
 
     norm_stats_path = _resolve_norm_stats_path(args, checkpoint_dir)
     if norm_stats_path is not None:
+        if not pathlib.Path(norm_stats_path).is_file():
+            raise FileNotFoundError(f"norm_stats file does not exist: {norm_stats_path}")
         exp.data_config.action_config.statistic_mapping = norm_stats_path
         if hasattr(exp.inference_config, "read_normalization_stats"):
             exp.inference_config.norm_stats = exp.inference_config.read_normalization_stats(norm_stats_path)
@@ -382,12 +459,81 @@ def _build_sample_records(dataset: Any) -> list[SampleRecord]:
     return records
 
 
-def _select_subset_indices(dataset: Any, episode_indices: list[int]) -> tuple[list[int], list[SampleRecord], list[str]]:
+def _resolve_inference_stride(model: torch.nn.Module, requested_stride: int) -> int:
+    if requested_stride > 0:
+        return requested_stride
+    if requested_stride < 0:
+        raise ValueError("--inference-stride must be >= 0.")
+
+    candidates = [
+        getattr(getattr(model, "model", None), "config", None),
+        getattr(model, "config", None),
+    ]
+    for config in candidates:
+        chunk_size = getattr(config, "chunk_size", None)
+        if chunk_size is not None:
+            chunk_size = int(chunk_size)
+            if chunk_size > 0:
+                return chunk_size
+    raise ValueError(
+        "--inference-stride 0 requested automatic chunk_size, but the loaded model "
+        "does not expose config.chunk_size."
+    )
+
+
+def _filter_records_by_stride(
+    records: list[SampleRecord],
+    indices: list[int],
+    inference_stride: int,
+) -> tuple[list[int], list[SampleRecord]]:
+    if inference_stride <= 1:
+        return indices, records
+
+    first_frame_by_episode: dict[int, int] = {}
+    for record in records:
+        first_frame_by_episode[record.episode_index] = min(
+            record.frame_index,
+            first_frame_by_episode.get(record.episode_index, record.frame_index),
+        )
+
+    filtered_indices: list[int] = []
+    filtered_records: list[SampleRecord] = []
+    for subset_index, record in zip(indices, records, strict=True):
+        episode_first_frame = first_frame_by_episode[record.episode_index]
+        if (record.frame_index - episode_first_frame) % inference_stride == 0:
+            filtered_indices.append(subset_index)
+            filtered_records.append(record)
+
+    return filtered_indices, filtered_records
+
+
+def _select_subset_indices(
+    dataset: Any,
+    episode_indices: list[int],
+    inference_stride: int,
+    max_episodes: int,
+    max_samples: int,
+) -> tuple[list[int], list[SampleRecord], list[str]]:
+    if max_episodes < 0:
+        raise ValueError("--max-episodes must be >= 0.")
+    if max_samples < 0:
+        raise ValueError("--max-samples must be >= 0.")
+
     all_records = _build_sample_records(dataset)
     episode_paths = _enumerate_episode_paths(dataset)
+    if not episode_indices and max_episodes > 0:
+        episode_indices = list(range(min(max_episodes, len(episode_paths))))
+    elif episode_indices and max_episodes > 0:
+        episode_indices = episode_indices[:max_episodes]
+
     if not episode_indices:
         indices = list(range(len(all_records)))
-        return indices, all_records, episode_paths
+        records = all_records
+        indices, records = _filter_records_by_stride(records, indices, inference_stride)
+        if max_samples > 0:
+            indices = indices[:max_samples]
+            records = records[:max_samples]
+        return indices, records, episode_paths
 
     unknown = [idx for idx in episode_indices if idx < 0 or idx >= len(episode_paths)]
     if unknown:
@@ -399,6 +545,10 @@ def _select_subset_indices(dataset: Any, episode_indices: list[int]) -> tuple[li
     selected = set(episode_indices)
     indices = [idx for idx, record in enumerate(all_records) if record.episode_index in selected]
     records = [all_records[idx] for idx in indices]
+    indices, records = _filter_records_by_stride(records, indices, inference_stride)
+    if max_samples > 0:
+        indices = indices[:max_samples]
+        records = records[:max_samples]
     return indices, records, episode_paths
 
 
@@ -409,7 +559,10 @@ def _build_eval_components(
     num_workers: int,
     shuffle: bool,
     episode_indices: list[int],
-) -> tuple[torch.nn.Module, DataLoader, Any, Any, list[SampleRecord], list[str]]:
+    requested_inference_stride: int,
+    max_episodes: int,
+    max_samples: int,
+) -> tuple[torch.nn.Module, DataLoader, Any, Any, list[SampleRecord], list[str], int]:
     inference_cfg = exp.inference_config
     inference_cfg._initialize_inference()
     model = inference_cfg.model
@@ -418,7 +571,25 @@ def _build_eval_components(
     tokenizer = inference_cfg.tokenizer
     image_processor = model.model.mm_vision_module.image_processor
     dataset, collator = exp.data_config.build_data(tokenizer, model.config.chat_template, image_processor)
-    subset_indices, sample_records, episode_paths = _select_subset_indices(dataset, episode_indices)
+    inference_stride = _resolve_inference_stride(model, requested_inference_stride)
+    subset_indices, sample_records, episode_paths = _select_subset_indices(
+        dataset,
+        episode_indices,
+        inference_stride,
+        max_episodes,
+        max_samples,
+    )
+    logging.info(
+        "Open-loop inference stride = %s frame(s)",
+        inference_stride,
+    )
+    logging.info("Open-loop max samples = %s", max_samples)
+    logging.info("Open-loop max episodes = %s", max_episodes)
+    logging.info("Open-loop batch size = %s", batch_size)
+    logging.info(
+        "Number of sampled observations = %s",
+        len(sample_records),
+    )
     subset = Subset(dataset, subset_indices)
     dataloader = DataLoader(
         subset,
@@ -427,7 +598,33 @@ def _build_eval_components(
         num_workers=num_workers,
         collate_fn=collator,
     )
-    return model, dataloader, inference_cfg, dataset, sample_records, episode_paths
+    return model, dataloader, inference_cfg, dataset, sample_records, episode_paths, inference_stride
+
+
+def _ensure_output_under_eval_root(path: pathlib.Path, description: str) -> None:
+    resolved = path.expanduser().resolve()
+    root = EVAL_OUTPUT_ROOT.resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"{description} must be under {root}; got {resolved}") from exc
+
+
+def _pop_first_present(mapping: dict[str, Any], keys: tuple[str, ...], description: str) -> Any:
+    for key in keys:
+        if key in mapping:
+            return mapping.pop(key)
+    available = ", ".join(sorted(mapping.keys()))
+    expected = " or ".join(keys)
+    raise KeyError(f"Could not find {description}. Expected {expected}; available keys: {available}")
+
+
+def _canonicalize_eval_batch(batch: dict[str, Any]) -> tuple[dict[str, Any], torch.Tensor, torch.Tensor]:
+    inputs = dict(batch)
+    gt_actions = _pop_first_present(inputs, ("actions", "action"), "ground-truth actions")
+    states = _pop_first_present(inputs, ("states", "state"), "states")
+    inputs["states"] = states
+    return inputs, gt_actions, states
 
 
 def _postprocess_actions(inference_cfg: Any, states: np.ndarray, actions: np.ndarray) -> np.ndarray:
@@ -592,6 +789,23 @@ def _plot_action_sequence_comparison(
     checkpoint_dir: pathlib.Path,
     plot_space: str,
 ) -> None:
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        logging.warning("matplotlib is not available; falling back to PIL plot writer.")
+        _plot_action_sequence_comparison_pil(
+            output_path=output_path,
+            gt_series=gt_series,
+            pred_series=pred_series,
+            action_labels=action_labels,
+            checkpoint_dir=checkpoint_dir,
+            plot_space=plot_space,
+        )
+        return
+
     if gt_series.shape != pred_series.shape:
         raise ValueError(f"gt_series shape {gt_series.shape} must match pred_series shape {pred_series.shape}")
 
@@ -616,6 +830,101 @@ def _plot_action_sequence_comparison(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_path, dpi=180, bbox_inches="tight", pad_inches=0.2)
     plt.close(fig)
+
+
+def _plot_action_sequence_comparison_pil(
+    *,
+    output_path: pathlib.Path,
+    gt_series: np.ndarray,
+    pred_series: np.ndarray,
+    action_labels: list[str],
+    checkpoint_dir: pathlib.Path,
+    plot_space: str,
+) -> None:
+    from PIL import Image, ImageDraw, ImageFont
+
+    if gt_series.shape != pred_series.shape:
+        raise ValueError(f"gt_series shape {gt_series.shape} must match pred_series shape {pred_series.shape}")
+
+    num_steps, action_dim = gt_series.shape
+    width = 1800
+    row_height = 180
+    top_margin = 88
+    left_margin = 100
+    right_margin = 36
+    bottom_margin = 54
+    plot_gap = 18
+    height = top_margin + action_dim * row_height + max(0, action_dim - 1) * plot_gap + bottom_margin
+
+    image = Image.new("RGB", (width, height), "white")
+    draw = ImageDraw.Draw(image)
+    font = ImageFont.load_default()
+
+    title = f"Dexbotic open-loop comparison | {checkpoint_dir.name} | {plot_space}"
+    draw.text((left_margin, 28), title, fill=(20, 20, 20), font=font)
+    draw.line((left_margin, 58, left_margin + 58, 58), fill=(31, 119, 180), width=4)
+    draw.text((left_margin + 68, 52), "gt", fill=(20, 20, 20), font=font)
+    draw.line((left_margin + 116, 58, left_margin + 174, 58), fill=(255, 127, 14), width=4)
+    draw.text((left_margin + 184, 52), "pred", fill=(20, 20, 20), font=font)
+
+    plot_width = width - left_margin - right_margin
+    x_values = np.arange(num_steps, dtype=np.float32)
+    if num_steps <= 1:
+        x_pixels = np.full((num_steps,), left_margin, dtype=np.float32)
+    else:
+        x_pixels = left_margin + (x_values / float(num_steps - 1)) * plot_width
+
+    for dim in range(action_dim):
+        y0 = top_margin + dim * (row_height + plot_gap)
+        y1 = y0 + row_height
+        label = action_labels[dim] if dim < len(action_labels) else f"action_{dim}"
+        draw.text((12, y0 + 8), label, fill=(20, 20, 20), font=font)
+
+        draw.rectangle((left_margin, y0, width - right_margin, y1), outline=(210, 210, 210), width=1)
+        for frac in (0.25, 0.5, 0.75):
+            gy = y0 + int(row_height * frac)
+            draw.line((left_margin, gy, width - right_margin, gy), fill=(235, 235, 235), width=1)
+
+        gt_dim = gt_series[:, dim].astype(np.float32)
+        pred_dim = pred_series[:, dim].astype(np.float32)
+        finite = np.isfinite(gt_dim) | np.isfinite(pred_dim)
+        if not np.any(finite):
+            continue
+
+        ymin = float(np.nanmin(np.concatenate([gt_dim[finite], pred_dim[finite]])))
+        ymax = float(np.nanmax(np.concatenate([gt_dim[finite], pred_dim[finite]])))
+        if not np.isfinite(ymin) or not np.isfinite(ymax):
+            continue
+        if abs(ymax - ymin) < 1e-6:
+            pad = 1.0 if abs(ymax) < 1e-6 else abs(ymax) * 0.1
+            ymin -= pad
+            ymax += pad
+        else:
+            pad = (ymax - ymin) * 0.08
+            ymin -= pad
+            ymax += pad
+
+        draw.text((left_margin + 4, y0 + 4), f"{ymax:.3g}", fill=(95, 95, 95), font=font)
+        draw.text((left_margin + 4, y1 - 16), f"{ymin:.3g}", fill=(95, 95, 95), font=font)
+
+        def _series_points(values: np.ndarray) -> list[tuple[float, float]] | None:
+            mask = np.isfinite(values)
+            if np.count_nonzero(mask) < 2:
+                return None
+            ys = y1 - ((values[mask] - ymin) / (ymax - ymin)) * row_height
+            xs = x_pixels[mask]
+            return [(float(x), float(y)) for x, y in zip(xs, ys)]
+
+        gt_points = _series_points(gt_dim)
+        pred_points = _series_points(pred_dim)
+        if gt_points:
+            draw.line(gt_points, fill=(31, 119, 180), width=2)
+        if pred_points:
+            draw.line(pred_points, fill=(255, 127, 14), width=2)
+
+    draw.text((left_margin, height - 32), "Timestep", fill=(20, 20, 20), font=font)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    image.save(output_path)
 
 
 def _slice_for_plot(series: np.ndarray, max_samples: int | None) -> np.ndarray:
@@ -755,8 +1064,13 @@ def main() -> None:
         raise FileNotFoundError(f"Checkpoint directory does not exist: {checkpoint_dir}")
     if args.batch_size <= 0:
         raise ValueError("--batch-size must be positive.")
-    if args.num_batches <= 0:
-        raise ValueError("--num-batches must be positive.")
+    if args.num_batches < 0:
+        raise ValueError("--num-batches must be >= 0.")
+    if args.shuffle:
+        raise ValueError(
+            "--shuffle is not supported for strided open-loop evaluation because "
+            "sample records must stay aligned with frame order."
+        )
     if args.diffusion_steps <= 0:
         raise ValueError("--diffusion-steps must be positive.")
     if args.smooth_window <= 0:
@@ -766,20 +1080,49 @@ def main() -> None:
     if args.binary_threshold_low > args.binary_threshold_high:
         raise ValueError("--binary-threshold-low must be <= --binary-threshold-high.")
 
+    plot_path = pathlib.Path(args.plot_path) if args.plot_path else checkpoint_dir / "openloop_action_plot.png"
+    normalized_plot_path = (
+        pathlib.Path(args.normalized_plot_path)
+        if args.normalized_plot_path
+        else checkpoint_dir / "openloop_action_plot_normalized.png"
+    )
+    metrics_path = pathlib.Path(args.metrics_path) if args.metrics_path else checkpoint_dir / "openloop_metrics.json"
+    array_dir = pathlib.Path(args.array_dir) if args.array_dir else checkpoint_dir
+    for output_path, description in (
+        (plot_path, "--plot-path"),
+        (normalized_plot_path, "--normalized-plot-path"),
+        (metrics_path, "--metrics-path"),
+        (array_dir, "--array-dir"),
+    ):
+        _ensure_output_under_eval_root(output_path, description)
+
     selected_episode_indices = _parse_csv_ints(args.episode_index)
     binary_dims = _parse_csv_ints(args.binary_dims)
 
     exp = _prepare_exp(args, checkpoint_dir)
+    norm_stats_path = _resolve_norm_stats_path(args, checkpoint_dir)
+    eval_device_map = os.getenv("DEXBOTIC_EVAL_DEVICE_MAP", "single").strip().lower()
+    eval_device = os.getenv("DEXBOTIC_EVAL_DEVICE", "cuda")
+    logging.info("Checkpoint = %s", checkpoint_dir)
+    logging.info("Norm stats = %s", norm_stats_path)
+    logging.info("Output dir = %s", metrics_path.parent)
+    logging.info("eval device = %s", eval_device)
+    logging.info("eval device_map mode = %s", eval_device_map)
     logging.info("Using experiment class: %s", type(exp).__name__)
-    logging.info("Evaluation dataset: %s", exp.data_config.dataset_name)
+    logging.info("Evaluation dataset = %s", exp.data_config.dataset_name)
 
-    model, dataloader, inference_cfg, dataset, sample_records, episode_paths = _build_eval_components(
+    model, dataloader, inference_cfg, dataset, sample_records, episode_paths, inference_stride = _build_eval_components(
         exp,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         shuffle=args.shuffle,
         episode_indices=selected_episode_indices,
+        requested_inference_stride=args.inference_stride,
+        max_episodes=args.max_episodes,
+        max_samples=args.max_samples,
     )
+    first_param_device = next(model.parameters()).device
+    logging.info("model first parameter device = %s", first_param_device)
 
     if selected_episode_indices:
         selected_paths = [episode_paths[idx] for idx in selected_episode_indices]
@@ -802,13 +1145,15 @@ def main() -> None:
 
     device = inference_cfg.device
     sample_cursor = 0
+    max_batches = math.ceil(len(sample_records) / args.batch_size) if sample_records else 0
+    if args.num_batches > 0:
+        max_batches = min(max_batches, args.num_batches)
 
     for batch_idx, batch in enumerate(dataloader, start=1):
-        if batch_idx > args.num_batches:
+        if args.num_batches > 0 and batch_idx > args.num_batches:
             break
 
-        inputs = dict(batch)
-        gt_actions = inputs.pop("actions")
+        inputs, gt_actions, states = _canonicalize_eval_batch(batch)
         batch_size = gt_actions.shape[0]
         batch_records = sample_records[sample_cursor : sample_cursor + batch_size]
         sample_cursor += batch_size
@@ -827,7 +1172,7 @@ def main() -> None:
 
         gt_actions_np = gt_actions.detach().cpu().numpy().astype(np.float32)
         pred_actions_np = pred_actions.detach().cpu().numpy().astype(np.float32)
-        states_np = batch["states"].detach().cpu().numpy().astype(np.float32)
+        states_np = states.detach().cpu().numpy().astype(np.float32)
         states_for_export_np = states_np.copy()
 
         pred_raw_np = _postprocess_actions(inference_cfg, states_np, pred_actions_np)
@@ -875,7 +1220,10 @@ def main() -> None:
         raw_pred_chunks_all.append(pred_raw_np)
         state_all.append(states_for_export_np)
 
-        logging.info("Processed batch %d/%d", batch_idx, args.num_batches)
+        if max_batches > 0:
+            logging.info("Processed batch %d/%d", batch_idx, max_batches)
+        else:
+            logging.info("Processed batch %d", batch_idx)
 
     if total_examples == 0:
         raise RuntimeError("No evaluation samples were processed.")
@@ -934,33 +1282,6 @@ def main() -> None:
     norm_gt_plot_series = _slice_for_plot(norm_gt_series, args.plot_max_samples)
     norm_pred_plot_series = _slice_for_plot(norm_pred_series, args.plot_max_samples)
 
-    plot_path = pathlib.Path(args.plot_path) if args.plot_path else checkpoint_dir / "openloop_action_plot.png"
-    normalized_plot_path = (
-        pathlib.Path(args.normalized_plot_path)
-        if args.normalized_plot_path
-        else checkpoint_dir / "openloop_action_plot_normalized.png"
-    )
-    metrics_path = pathlib.Path(args.metrics_path) if args.metrics_path else checkpoint_dir / "openloop_metrics.json"
-    array_dir = pathlib.Path(args.array_dir) if args.array_dir else checkpoint_dir
-
-    action_labels = _expand_action_labels(raw_gt_chunks.shape[-1])
-    _plot_action_sequence_comparison(
-        output_path=plot_path,
-        gt_series=raw_gt_plot_series,
-        pred_series=raw_pred_plot_series,
-        action_labels=action_labels,
-        checkpoint_dir=checkpoint_dir,
-        plot_space="raw",
-    )
-    _plot_action_sequence_comparison(
-        output_path=normalized_plot_path,
-        gt_series=norm_gt_plot_series,
-        pred_series=norm_pred_plot_series,
-        action_labels=action_labels,
-        checkpoint_dir=checkpoint_dir,
-        plot_space="normalized",
-    )
-
     array_paths: dict[str, str] = {}
     if args.save_arrays:
         array_paths = _save_arrays(
@@ -977,15 +1298,47 @@ def main() -> None:
             gt_norm_chunks=norm_gt_chunks,
         )
 
+    action_labels = _expand_action_labels(raw_gt_chunks.shape[-1])
+    plots_saved = False
+    plot_error = None
+    if args.no_plots:
+        logging.info("Skipping plot generation because --no-plots was set.")
+    else:
+        try:
+            _plot_action_sequence_comparison(
+                output_path=plot_path,
+                gt_series=raw_gt_plot_series,
+                pred_series=raw_pred_plot_series,
+                action_labels=action_labels,
+                checkpoint_dir=checkpoint_dir,
+                plot_space="raw",
+            )
+            _plot_action_sequence_comparison(
+                output_path=normalized_plot_path,
+                gt_series=norm_gt_plot_series,
+                pred_series=norm_pred_plot_series,
+                action_labels=action_labels,
+                checkpoint_dir=checkpoint_dir,
+                plot_space="normalized",
+            )
+            plots_saved = True
+        except Exception as exc:
+            plot_error = repr(exc)
+            logging.exception("Plot generation failed; metrics and arrays will still be saved.")
+
     results = {
         "checkpoint_dir": str(checkpoint_dir),
         "exp_class": type(exp).__name__,
         "dataset_name": exp.data_config.dataset_name,
         "num_batches": args.num_batches,
         "batch_size": args.batch_size,
+        "max_samples": args.max_samples,
+        "max_episodes": args.max_episodes,
         "num_examples": total_examples,
         "diffusion_steps": args.diffusion_steps,
         "single_gpu_id": args.single_gpu_id,
+        "requested_inference_stride": args.inference_stride,
+        "inference_stride": inference_stride,
         "chunk_merge": args.chunk_merge,
         "chunk_merge_exp_decay": args.chunk_merge_exp_decay,
         "smooth_window": args.smooth_window,
@@ -1006,6 +1359,8 @@ def main() -> None:
         "raw_per_horizon_mse": (raw_per_horizon_sum / total_examples).tolist(),
         "plot_path": str(plot_path),
         "normalized_plot_path": str(normalized_plot_path),
+        "plots_saved": plots_saved,
+        "plot_error": plot_error,
         "array_paths": array_paths,
     }
 
@@ -1013,8 +1368,9 @@ def main() -> None:
     with open(metrics_path, "w") as f:
         json.dump(results, f, indent=2)
 
-    logging.info("Saved raw plot to %s", plot_path)
-    logging.info("Saved normalized plot to %s", normalized_plot_path)
+    if plots_saved:
+        logging.info("Saved raw plot to %s", plot_path)
+        logging.info("Saved normalized plot to %s", normalized_plot_path)
     logging.info("Saved metrics to %s", metrics_path)
     logging.info("raw_action_mse=%.6f raw_action_mae=%.6f", results["raw_action_mse"], results["raw_action_mae"])
     logging.info(

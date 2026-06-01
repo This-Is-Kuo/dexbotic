@@ -19,7 +19,7 @@ from openloop.tools.openloop_debug_utils import load_array, per_dim_metrics, sav
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoints", nargs="+", required=True)
-    parser.add_argument("--episode_id", type=int, default=0)
+    parser.add_argument("--episode_id", type=int, default=None)
     parser.add_argument("--save_dir", required=True)
     parser.add_argument("--exp_file", default="playground/benchmarks/custom/post_data_01_dm0.py")
     parser.add_argument("--dataset_name", default="post_data_01_default")
@@ -28,9 +28,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--num_batches", type=int, default=100000)
+    parser.add_argument("--inference_stride", type=int, default=1)
     parser.add_argument("--binary_dims", default="6,13")
     parser.add_argument("--binary_threshold", type=float, default=0.5)
     parser.add_argument("--single_gpu_id", type=int, default=None)
+    parser.add_argument("--no_plots", action="store_true")
     return parser.parse_args()
 
 
@@ -73,8 +75,6 @@ def main() -> None:
             args.exp_file,
             "--dataset-name",
             args.dataset_name,
-            "--episode-index",
-            str(args.episode_id),
             "--chunk_merge",
             args.chunk_merge,
             "--batch-size",
@@ -83,6 +83,8 @@ def main() -> None:
             str(args.num_workers),
             "--num-batches",
             str(args.num_batches),
+            "--inference-stride",
+            str(args.inference_stride),
             "--save-arrays",
             "true",
             "--metrics-path",
@@ -94,6 +96,10 @@ def main() -> None:
             "--array-dir",
             str(ckpt_dir),
         ]
+        if args.no_plots:
+            cmd.append("--no-plots")
+        if args.episode_id is not None:
+            cmd.extend(["--episode-index", str(args.episode_id)])
         if args.single_gpu_id is not None:
             cmd.extend(["--single-gpu-id", str(args.single_gpu_id)])
         if args.norm_stats:
