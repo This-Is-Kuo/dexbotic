@@ -182,16 +182,21 @@ dexbotic/data/data_source/*.py
 !dexbotic/data/data_source/__init__.py
 !dexbotic/data/data_source/register.py
 !dexbotic/data/data_source/uninavid_official.py
+!dexbotic/data/data_source/post_sort_dm0_nobframes.py
 dexbotic/norm_assets
 
 # Local Codex / open-loop debug workspace
 .codex
 .codex/
+.codex_deps/
+.agents/
 openloop/artifacts/
 debug_openloop_gpu/
 debug_openloop_retrain_compare/
 debug_openloop_resume_eval_v2/
 debug_openloop_stateful_compare/
+debug_data_check/
+logs/
 tmp_openloop_arrays/
 tmp_openloop_chunk_arrays/
 tmp_single_gpu_switch_arrays/
