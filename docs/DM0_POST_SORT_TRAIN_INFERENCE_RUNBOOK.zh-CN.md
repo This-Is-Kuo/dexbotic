@@ -343,4 +343,3 @@ find /mnt/datadisk/guoyaokun/checkpoints/DM0/finetune \
 Stage 1 最新: post_sort_stage1_mix_fullft/checkpoint-6500
 Stage 2 最新: post_sort_stage2_new_slow_fullft/checkpoint-2000
 ```
-

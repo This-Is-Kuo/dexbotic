@@ -138,4 +138,3 @@ POST /process_frame
 - 根据真实推理延迟调优异步 bridge 的重规划周期、预取阈值、soft-replace 和 blend 参数。
 - 继续推进 Stage 2 续训，并结合 open-loop 与真实 rollout 结果选择最终 checkpoint。
 - 重点观察左右 pinch 维度的误差表现，结合执行器语义确认是否需要单独处理或补充数据。
-

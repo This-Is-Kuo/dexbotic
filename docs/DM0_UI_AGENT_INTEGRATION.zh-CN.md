@@ -475,4 +475,3 @@ curl -X POST http://localhost:7891/process_frame \
   "response": [[... 14 floats ...], "... up to 50 actions ..."]
 }
 ```
-
