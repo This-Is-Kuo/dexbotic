@@ -1,0 +1,7 @@
+numpy
+torch
+torchvision
+lerobot
+av
+requests
+pillow
