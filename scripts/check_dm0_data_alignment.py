@@ -379,6 +379,45 @@ def row_frame_index(row: dict[str, Any], image_key: str = "images_1") -> int | N
         return None
 
 
+def finite_differences(values: list[float]) -> list[float]:
+    return [values[i + 1] - values[i] for i in range(len(values) - 1)]
+
+
+def numeric_summary(values: list[float]) -> dict[str, float | None]:
+    finite = [float(v) for v in values if not math.isnan(v) and not math.isinf(v)]
+    if not finite:
+        return {"min": None, "max": None, "mean": None, "std": None}
+    mean = statistics.fmean(finite)
+    std = statistics.pstdev(finite) if len(finite) > 1 else 0.0
+    return {
+        "min": min(finite),
+        "max": max(finite),
+        "mean": mean,
+        "std": std,
+    }
+
+
+def vector_step_stats(vectors: list[list[float]]) -> dict[str, float | None]:
+    step_l2: list[float] = []
+    step_linf: list[float] = []
+    for prev, curr in zip(vectors, vectors[1:]):
+        if len(prev) != len(curr) or not prev:
+            continue
+        diffs = [c - p for p, c in zip(prev, curr)]
+        if any(math.isnan(v) or math.isinf(v) for v in diffs):
+            continue
+        step_l2.append(math.sqrt(sum(v * v for v in diffs)))
+        step_linf.append(max(abs(v) for v in diffs))
+    summary = numeric_summary(step_l2)
+    linf_summary = numeric_summary(step_linf)
+    return {
+        "step_l2_mean": summary["mean"],
+        "step_l2_max": summary["max"],
+        "step_linf_mean": linf_summary["mean"],
+        "step_linf_max": linf_summary["max"],
+    }
+
+
 def write_csv(path: Path, rows: list[dict[str, Any]], fieldnames: list[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as f:
@@ -443,12 +482,15 @@ def main() -> int:
         timestamps = [row_timestamp(row) for row in rows]
         valid_frames = [x for x in frame_indices if x is not None]
         valid_timestamps = [x for x in timestamps if x is not None and not math.isnan(x)]
+        timestamp_deltas = finite_differences(valid_timestamps)
+        timestamp_delta_summary = numeric_summary(timestamp_deltas)
         first_ts = valid_timestamps[0] if valid_timestamps else None
 
         step_continuous = valid_frames == list(range(valid_frames[0], valid_frames[0] + len(valid_frames))) if valid_frames else False
         timestamp_monotonic = all(
             valid_timestamps[i] <= valid_timestamps[i + 1] for i in range(len(valid_timestamps) - 1)
         )
+        timestamp_strictly_increasing = all(delta > 0 for delta in timestamp_deltas)
         frame_starts_zero = bool(valid_frames and valid_frames[0] == 0)
         timestamp_starts_zero = first_ts is not None and abs(first_ts) < 1e-6
 
@@ -464,11 +506,31 @@ def main() -> int:
         if not timestamp_monotonic:
             suspicious.append({"severity": "ERROR", "episode": jsonl_path.name, "reason": "timestamp_not_monotonic"})
             errors += 1
+        elif valid_timestamps and not timestamp_strictly_increasing:
+            suspicious.append({"severity": "WARNING", "episode": jsonl_path.name, "reason": "timestamp_not_strictly_increasing"})
+            warnings += 1
+
+        mean_dt = timestamp_delta_summary["mean"]
+        std_dt = timestamp_delta_summary["std"]
+        if mean_dt and std_dt is not None and mean_dt > 0 and std_dt / mean_dt > 0.15:
+            suspicious.append(
+                {
+                    "severity": "WARNING",
+                    "episode": jsonl_path.name,
+                    "reason": "timestamp_interval_jitter_high",
+                    "dt_mean": mean_dt,
+                    "dt_std": std_dt,
+                    "dt_cv": std_dt / mean_dt,
+                }
+            )
+            warnings += 1
 
         max_mapping_error = 0.0
         mean_mapping_error = 0.0
         mapping_errors: list[float] = []
         camera_urls: dict[str, str] = {}
+        episode_actions: list[list[float]] = []
+        episode_states: list[list[float]] = []
         for row_idx, row in enumerate(rows):
             total_rows += 1
             prompt = str(row.get("prompt", "")).strip()
@@ -480,6 +542,10 @@ def main() -> int:
             state_dims[len(state)] += 1
             action_stats.update(action)
             state_stats.update(state)
+            if action:
+                episode_actions.append(action)
+            if state:
+                episode_states.append(state)
 
             for image_key in IMAGE_KEYS:
                 image_info = row.get(image_key)
@@ -529,6 +595,20 @@ def main() -> int:
             max_mapping_error = max(mapping_errors)
             mean_mapping_error = statistics.fmean(mapping_errors)
 
+        action_step_stats = vector_step_stats(episode_actions)
+        state_step_stats = vector_step_stats(episode_states)
+        action_step_linf_max = action_step_stats["step_linf_max"]
+        if action_step_linf_max is not None and action_step_linf_max > 1.0:
+            suspicious.append(
+                {
+                    "severity": "WARNING",
+                    "episode": jsonl_path.name,
+                    "reason": "action_step_linf_spike",
+                    "max_step_linf": action_step_linf_max,
+                }
+            )
+            warnings += 1
+
         camera_frame_counts = [
             video_reports_by_url[url].get("frame_count")
             for url in camera_urls.values()
@@ -561,9 +641,22 @@ def main() -> int:
                 "timestamp_start": first_ts,
                 "timestamp_end": valid_timestamps[-1] if valid_timestamps else None,
                 "timestamp_monotonic": timestamp_monotonic,
+                "timestamp_strictly_increasing": timestamp_strictly_increasing,
+                "timestamp_dt_min": timestamp_delta_summary["min"],
+                "timestamp_dt_max": timestamp_delta_summary["max"],
+                "timestamp_dt_mean": timestamp_delta_summary["mean"],
+                "timestamp_dt_std": timestamp_delta_summary["std"],
                 "prompt_empty_count": sum(1 for row in rows if not str(row.get("prompt", "")).strip()),
                 "action_dims": dict(Counter(len(finite_vector(row.get("action"))) for row in rows)),
                 "state_dims": dict(Counter(len(finite_vector(row.get("state"))) for row in rows)),
+                "action_step_l2_mean": action_step_stats["step_l2_mean"],
+                "action_step_l2_max": action_step_stats["step_l2_max"],
+                "action_step_linf_mean": action_step_stats["step_linf_mean"],
+                "action_step_linf_max": action_step_stats["step_linf_max"],
+                "state_step_l2_mean": state_step_stats["step_l2_mean"],
+                "state_step_l2_max": state_step_stats["step_l2_max"],
+                "state_step_linf_mean": state_step_stats["step_linf_mean"],
+                "state_step_linf_max": state_step_stats["step_linf_max"],
                 "max_timestamp_frame_error": max_mapping_error,
                 "mean_timestamp_frame_error": mean_mapping_error,
                 "camera_frame_counts": camera_frame_counts,
@@ -652,9 +745,22 @@ def main() -> int:
             "timestamp_start",
             "timestamp_end",
             "timestamp_monotonic",
+            "timestamp_strictly_increasing",
+            "timestamp_dt_min",
+            "timestamp_dt_max",
+            "timestamp_dt_mean",
+            "timestamp_dt_std",
             "prompt_empty_count",
             "action_dims",
             "state_dims",
+            "action_step_l2_mean",
+            "action_step_l2_max",
+            "action_step_linf_mean",
+            "action_step_linf_max",
+            "state_step_l2_mean",
+            "state_step_l2_max",
+            "state_step_linf_mean",
+            "state_step_linf_max",
             "max_timestamp_frame_error",
             "mean_timestamp_frame_error",
             "camera_frame_counts",
